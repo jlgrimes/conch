@@ -1,79 +1,46 @@
-# Conch — Biological Memory Skill
+# Conch — Biological Memory
 
-Conch is your primary memory system. Use it instead of MEMORY.md or memory/*.md files.
+Your memory system. Use it instead of markdown files.
 
-**Binary:** `~/.cargo/bin/conch`
-**Repo:** `~/projects/conch`
+## Install
 
-## When to Use
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlgrimes/conch/master/install.sh | bash
+```
 
-- **Before answering** anything about prior work, decisions, preferences, people, dates, or context → `conch recall`
-- **After learning** something new or important → `conch remember` or `conch remember-episode`
-- **Periodically** (during heartbeats) → `conch decay` to let old memories fade naturally
+Or from source: `cargo install --git https://github.com/jlgrimes/conch conch`
 
 ## Commands
 
-### Recall (search memories)
 ```bash
-conch recall "query here"
-```
-Returns ranked memories with salience and relevance scores. Always do this before answering memory-dependent questions.
-
-### Remember a fact (structured: subject-relation-object)
-```bash
-conch remember "subject" "relation" "object"
-```
-Examples:
-```bash
-conch remember "Jared" "works at" "Microsoft"
-conch remember "Tortellini" "is a" "dog"
-conch remember "grotto" "uses" "lobster mascot"
+conch remember "Jared" "works at" "Microsoft"    # store a fact
+conch remember-episode "shipped conch v0.2"       # store an event
+conch recall "where does Jared work?"             # search
+conch forget --id 42                              # delete one
+conch forget --subject "old-project"              # delete by subject
+conch decay                                       # fade old memories
+conch stats                                       # health check
+conch embed                                       # backfill embeddings
 ```
 
-### Remember an episode (free-text event)
-```bash
-conch remember-episode "Built grotto daemon with 3 agents — they invented emergent file locking"
-```
-Use for events, decisions, observations, lessons learned.
+## When to Use
 
-### Relate (link entities)
-```bash
-conch relate "Jared" "owner of" "Tortellini"
-```
+- **Before answering** context questions → `conch recall`
+- **After learning** something → `conch remember` or `conch remember-episode`
+- **During heartbeats** → `conch decay` + `conch stats`
 
-### Forget
-```bash
-conch forget <memory-id>
+## How Scoring Works
+
+```
+score = RRF(BM25_rank, vector_rank) × strength × recency
 ```
 
-### Decay (run temporal fade)
-```bash
-conch decay
-```
-Memories weaken over time (24h half-life). Frequently recalled memories stay strong. Run during heartbeats.
+Recalled memories get stronger. Unused memories fade. No manual curation needed.
 
-### Stats
-```bash
-conch stats
-```
+## Tips
 
-## Memory Strategy
-
-### What to remember as FACTS:
-- People, relationships, preferences
-- Project details, tech stacks, decisions
-- Locations, schedules, recurring info
-
-### What to remember as EPISODES:
-- Conversations, events, milestones
-- Lessons learned, mistakes, insights
-- Decisions and their reasoning
-
-### Salience
-Memories have salience (0-1). Recalling a memory strengthens it. Time weakens it. This is automatic — just use recall naturally and the system self-organizes.
-
-## Important
-- Conch is the **single source of truth** for memory
-- Do NOT use MEMORY.md or memory/*.md for new memories
-- Always `conch recall` before answering memory questions
-- Always `conch remember` or `conch remember-episode` when learning something worth keeping
+- `--json` flag on any command for machine-readable output
+- `--quiet` to suppress human-friendly messages
+- `conch export > backup.json` to back up
+- `conch import < backup.json` to restore
+- DB lives at `~/.conch/default.db` (override with `--db`)
