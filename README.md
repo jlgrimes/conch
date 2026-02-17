@@ -53,9 +53,25 @@ conch export > backup.json
 # Import
 conch import < backup.json
 
-# Or use helper script
+# Helper script
 bash scripts/import-memories.sh backup.json
 ```
+
+## Import from OpenClaw/ChatGPT conversations JSON
+
+If you have a big `conversations.json` export, bulk-import it as episodes:
+
+```bash
+python3 scripts/import-openclaw-conversations.py \
+  --input ~/conversations.json \
+  --db ~/.conch/default.db \
+  --prefix-title
+
+# then generate embeddings in batch
+conch embed
+```
+
+Default imports only **user** messages (cleaner memory). Add `--include-assistant` if you want both sides.
 
 ## Commands
 
