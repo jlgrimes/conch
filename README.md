@@ -57,6 +57,21 @@ conch import < backup.json
 bash scripts/import-memories.sh backup.json
 ```
 
+## Import only important stuff from conversations.json
+
+```bash
+python3 scripts/import-openclaw-important.py \
+  --input ~/conversations.json \
+  --db ~/.conch/default.db
+
+conch embed
+```
+
+Defaults:
+- imports only **user** messages
+- filters by an importance score (preferences, decisions, todos, problems, project context)
+- dedupes exact repeated messages
+
 ## Import from OpenClaw/ChatGPT conversations JSON
 
 If you have a big `conversations.json` export, bulk-import it as episodes:
