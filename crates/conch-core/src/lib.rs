@@ -2,6 +2,7 @@ pub mod decay;
 pub mod embed;
 pub mod memory;
 pub mod recall;
+mod recall_scoring;
 pub mod store;
 
 pub use decay::{run_decay, DecayResult};
