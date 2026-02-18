@@ -44,16 +44,35 @@ const RECENCY_HALF_LIFE_HOURS: f64 = 168.0;
 /// Minimum recency multiplier so old memories aren't completely suppressed.
 const RECENCY_FLOOR: f64 = 0.3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecallKindFilter {
+    All,
+    Facts,
+    Episodes,
+}
+
+impl RecallKindFilter {
+    fn matches(self, kind: &MemoryKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Facts => matches!(kind, MemoryKind::Fact(_)),
+            Self::Episodes => matches!(kind, MemoryKind::Episode(_)),
+        }
+    }
+}
+
 /// Hybrid recall: BM25 + vector search fused via Reciprocal Rank Fusion,
 /// enhanced with brain-inspired scoring heuristics.
 ///
 /// Pipeline:
-/// 1. BM25 search (keyword relevance)
-/// 2. Vector search (semantic relevance, cosine sim > threshold)
-/// 3. RRF fusion of both rankings
-/// 4. Base score = RRF × decayed_strength × recency_boost × access_weight
-/// 5. 1-hop spreading activation through the knowledge graph
-/// 6. Temporal co-occurrence boost for memories created near top results
+/// 1. Filter candidates by memory kind (if requested)
+/// 2. BM25 search (keyword relevance)
+/// 3. Vector search (semantic relevance, cosine sim > threshold)
+/// 4. RRF fusion of both rankings
+/// 5. Base score = RRF × decayed_strength × recency_boost × access_weight
+/// 6. 1-hop spreading activation through the knowledge graph
+/// 7. Temporal co-occurrence boost for memories created near top results
 ///
 /// Recalled memories are "touched" (decay is applied, then reinforced, and
 /// access count bumped).
@@ -63,29 +82,43 @@ pub fn recall(
     embedder: &dyn Embedder,
     limit: usize,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let all_memories = store.all_memories_with_text().map_err(RecallError::Db)?;
+    recall_with_filter(store, query, embedder, limit, RecallKindFilter::All)
+}
 
-    if all_memories.is_empty() {
+pub fn recall_with_filter(
+    store: &MemoryStore,
+    query: &str,
+    embedder: &dyn Embedder,
+    limit: usize,
+    filter: RecallKindFilter,
+) -> Result<Vec<RecallResult>, RecallError> {
+    let all_memories = store.all_memories_with_text().map_err(RecallError::Db)?;
+    let filtered_memories: Vec<(MemoryRecord, String)> = all_memories
+        .into_iter()
+        .filter(|(m, _)| filter.matches(&m.kind))
+        .collect();
+
+    if filtered_memories.is_empty() {
         return Ok(vec![]);
     }
 
     let now = Utc::now();
 
     // Find the maximum access_count for normalization.
-    let max_access = all_memories
+    let max_access = filtered_memories
         .iter()
         .map(|(m, _)| m.access_count)
         .max()
         .unwrap_or(0);
 
     // BM25
-    let bm25_ranked = bm25_search(query, &all_memories);
+    let bm25_ranked = bm25_search(query, &filtered_memories);
 
     // Vector
     let query_embedding = embedder
         .embed_one(query)
         .map_err(|e| RecallError::Embedding(e.to_string()))?;
-    let vector_ranked = vector_search(&query_embedding, &all_memories);
+    let vector_ranked = vector_search(&query_embedding, &filtered_memories);
 
     // RRF fusion
     let fused = rrf(&bm25_ranked, &vector_ranked);
@@ -98,7 +131,7 @@ pub fn recall(
     // Score = RRF × decayed_strength × recency_boost × access_weight
     let mut results: Vec<RecallResult> = candidates
         .map(|(idx, rrf_score)| {
-            let mem = &all_memories[idx].0;
+            let mem = &filtered_memories[idx].0;
             let decayed_strength = effective_strength(mem, now);
             let recency = recency_boost(mem, now);
             let access = access_weight(mem, max_access);
@@ -120,7 +153,11 @@ pub fn recall(
     // reinstatement principle.
     temporal_cooccurrence_boost(&mut results);
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(limit);
 
     // Touch recalled memories: apply decay first, then reinforce.
@@ -231,9 +268,7 @@ fn temporal_cooccurrence_boost(results: &mut [RecallResult]) {
             if j == *ai {
                 continue;
             }
-            let gap_minutes = (*a_time - r.memory.created_at)
-                .num_minutes()
-                .unsigned_abs() as f64;
+            let gap_minutes = (*a_time - r.memory.created_at).num_minutes().unsigned_abs() as f64;
             if gap_minutes < 30.0 {
                 let proximity = 0.1 * (1.0 - gap_minutes / 30.0);
                 *boosts.entry(j).or_insert(0.0) += a_score * proximity;
@@ -370,7 +405,9 @@ mod tests {
     #[test]
     fn effective_strength_decays_by_kind() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let fact_id = store.remember_fact("Jared", "builds", "Gen", Some(&[1.0, 0.0])).unwrap();
+        let fact_id = store
+            .remember_fact("Jared", "builds", "Gen", Some(&[1.0, 0.0]))
+            .unwrap();
         let ep_id = store
             .remember_episode("alpha project context", Some(&[1.0, 0.0]))
             .unwrap();
@@ -445,7 +482,12 @@ mod tests {
 
         let mem = store.get_memory(id).unwrap().unwrap();
         let boost = recency_boost(&mem, now);
-        assert!(boost >= RECENCY_FLOOR, "recency boost {} should be >= floor {}", boost, RECENCY_FLOOR);
+        assert!(
+            boost >= RECENCY_FLOOR,
+            "recency boost {} should be >= floor {}",
+            boost,
+            RECENCY_FLOOR
+        );
     }
 
     // ── Access weight tests ──────────────────────────────────
@@ -477,9 +519,22 @@ mod tests {
         let hot_w = access_weight(&hot, 20);
         let cold_w = access_weight(&cold, 20);
 
-        assert!(hot_w > cold_w, "hot ({}) should weigh more than cold ({})", hot_w, cold_w);
-        assert!(hot_w >= 1.0 && hot_w <= 2.0, "access weight should be in [1.0, 2.0], got {}", hot_w);
-        assert!(cold_w >= 1.0, "cold access weight should be >= 1.0, got {}", cold_w);
+        assert!(
+            hot_w > cold_w,
+            "hot ({}) should weigh more than cold ({})",
+            hot_w,
+            cold_w
+        );
+        assert!(
+            hot_w >= 1.0 && hot_w <= 2.0,
+            "access weight should be in [1.0, 2.0], got {}",
+            hot_w
+        );
+        assert!(
+            cold_w >= 1.0,
+            "cold access weight should be >= 1.0, got {}",
+            cold_w
+        );
     }
 
     #[test]
@@ -569,12 +624,10 @@ mod tests {
 
     #[test]
     fn spreading_activation_does_not_self_boost() {
-        let mut results = vec![
-            RecallResult {
-                memory: make_fact_record(1, "Jared", "builds", "Gen"),
-                score: 1.0,
-            },
-        ];
+        let mut results = vec![RecallResult {
+            memory: make_fact_record(1, "Jared", "builds", "Gen"),
+            score: 1.0,
+        }];
 
         spread_activation(&mut results, SPREAD_FACTOR);
         // Single result — no self-boost possible
@@ -593,11 +646,19 @@ mod tests {
                 score: 1.0,
             },
             RecallResult {
-                memory: make_timed_episode(2, "alpha nearby memory", now - chrono::Duration::minutes(5)),
+                memory: make_timed_episode(
+                    2,
+                    "alpha nearby memory",
+                    now - chrono::Duration::minutes(5),
+                ),
                 score: 0.2,
             },
             RecallResult {
-                memory: make_timed_episode(3, "alpha distant memory", now - chrono::Duration::hours(3)),
+                memory: make_timed_episode(
+                    3,
+                    "alpha distant memory",
+                    now - chrono::Duration::hours(3),
+                ),
                 score: 0.2,
             },
         ];
@@ -629,7 +690,11 @@ mod tests {
                 score: 1.0,
             },
             RecallResult {
-                memory: make_timed_episode(2, "alpha very close", now - chrono::Duration::minutes(2)),
+                memory: make_timed_episode(
+                    2,
+                    "alpha very close",
+                    now - chrono::Duration::minutes(2),
+                ),
                 score: 0.1,
             },
             RecallResult {
@@ -657,11 +722,17 @@ mod tests {
         let now = Utc::now();
 
         // Create a cluster of related facts about a topic
-        store.remember_fact("Jared", "has_pet", "Tortellini", Some(&[1.0, 0.0])).unwrap();
-        store.remember_fact("Tortellini", "is_a", "dog", Some(&[1.0, 0.0])).unwrap();
+        store
+            .remember_fact("Jared", "has_pet", "Tortellini", Some(&[1.0, 0.0]))
+            .unwrap();
+        store
+            .remember_fact("Tortellini", "is_a", "dog", Some(&[1.0, 0.0]))
+            .unwrap();
 
         // Create an old, unrelated memory
-        let old_id = store.remember_fact("weather", "is", "sunny", Some(&[0.5, 0.5])).unwrap();
+        let old_id = store
+            .remember_fact("weather", "is", "sunny", Some(&[0.5, 0.5]))
+            .unwrap();
         let old_time = (now - chrono::Duration::days(60)).to_rfc3339();
         store
             .conn()
@@ -713,6 +784,71 @@ mod tests {
             access_count: 0,
             embedding: None,
         }
+    }
+
+    // ── Recall kind filtering tests ──────────────────────────
+
+    #[test]
+    fn recall_filter_facts_only_excludes_episodes() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .remember_fact("Jared", "builds", "conch", Some(&[1.0, 0.0]))
+            .unwrap();
+        store
+            .remember_episode("Jared had coffee", Some(&[1.0, 0.0]))
+            .unwrap();
+
+        let results =
+            recall_with_filter(&store, "Jared", &MockEmbedder, 10, RecallKindFilter::Facts)
+                .unwrap();
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|r| matches!(r.memory.kind, MemoryKind::Fact(_))));
+    }
+
+    #[test]
+    fn recall_filter_episodes_only_excludes_facts() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .remember_fact("Jared", "builds", "conch", Some(&[1.0, 0.0]))
+            .unwrap();
+        store
+            .remember_episode("Jared had coffee", Some(&[1.0, 0.0]))
+            .unwrap();
+
+        let results = recall_with_filter(
+            &store,
+            "Jared",
+            &MockEmbedder,
+            10,
+            RecallKindFilter::Episodes,
+        )
+        .unwrap();
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|r| matches!(r.memory.kind, MemoryKind::Episode(_))));
+    }
+
+    #[test]
+    fn recall_filter_all_returns_both_kinds() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .remember_fact("Jared", "builds", "conch", Some(&[1.0, 0.0]))
+            .unwrap();
+        store
+            .remember_episode("Jared had coffee", Some(&[1.0, 0.0]))
+            .unwrap();
+
+        let results =
+            recall_with_filter(&store, "Jared", &MockEmbedder, 10, RecallKindFilter::All).unwrap();
+        assert!(results
+            .iter()
+            .any(|r| matches!(r.memory.kind, MemoryKind::Fact(_))));
+        assert!(results
+            .iter()
+            .any(|r| matches!(r.memory.kind, MemoryKind::Episode(_))));
     }
 
     // ── Original tests ───────────────────────────────────────

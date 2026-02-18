@@ -1,14 +1,14 @@
-pub mod memory;
-pub mod store;
-pub mod embed;
 pub mod decay;
+pub mod embed;
+pub mod memory;
 pub mod recall;
+pub mod store;
 
-pub use memory::{Episode, ExportData, Fact, MemoryKind, MemoryRecord, MemoryStats};
-pub use store::MemoryStore;
-pub use embed::{Embedder, EmbedError, FastEmbedder, SharedEmbedder, cosine_similarity};
 pub use decay::{run_decay, DecayResult};
-pub use recall::{recall, RecallResult, RecallError};
+pub use embed::{cosine_similarity, EmbedError, Embedder, FastEmbedder, SharedEmbedder};
+pub use memory::{Episode, ExportData, Fact, MemoryKind, MemoryRecord, MemoryStats};
+pub use recall::{recall, recall_with_filter, RecallError, RecallKindFilter, RecallResult};
+pub use store::MemoryStore;
 
 use chrono::Duration;
 
@@ -30,7 +30,10 @@ impl ConchDB {
     pub fn open(path: &str) -> Result<Self, ConchError> {
         let store = MemoryStore::open(path)?;
         let embedder = embed::FastEmbedder::new()?;
-        Ok(Self { store, embedder: Box::new(embedder) })
+        Ok(Self {
+            store,
+            embedder: Box::new(embedder),
+        })
     }
 
     pub fn open_in_memory_with(embedder: Box<dyn Embedder>) -> Result<Self, ConchError> {
@@ -42,15 +45,25 @@ impl ConchDB {
         &self.store
     }
 
-    pub fn remember_fact(&self, subject: &str, relation: &str, object: &str) -> Result<MemoryRecord, ConchError> {
+    pub fn remember_fact(
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+    ) -> Result<MemoryRecord, ConchError> {
         // Check for existing duplicate
         if let Some(existing) = self.store.find_fact(subject, relation, object)? {
             self.store.reinforce_memory(existing.id)?;
-            return Ok(self.store.get_memory(existing.id)?.expect("just reinforced"));
+            return Ok(self
+                .store
+                .get_memory(existing.id)?
+                .expect("just reinforced"));
         }
         let text = format!("{subject} {relation} {object}");
         let embedding = self.embedder.embed_one(&text)?;
-        let id = self.store.remember_fact(subject, relation, object, Some(&embedding))?;
+        let id = self
+            .store
+            .remember_fact(subject, relation, object, Some(&embedding))?;
         Ok(self.store.get_memory(id)?.expect("just inserted"))
     }
 
@@ -58,7 +71,10 @@ impl ConchDB {
         // Check for existing duplicate
         if let Some(existing) = self.store.find_episode(text)? {
             self.store.reinforce_memory(existing.id)?;
-            return Ok(self.store.get_memory(existing.id)?.expect("just reinforced"));
+            return Ok(self
+                .store
+                .get_memory(existing.id)?
+                .expect("just reinforced"));
         }
         let embedding = self.embedder.embed_one(text)?;
         let id = self.store.remember_episode(text, Some(&embedding))?;
@@ -66,11 +82,24 @@ impl ConchDB {
     }
 
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<RecallResult>, ConchError> {
-        recall::recall(&self.store, query, self.embedder.as_ref(), limit)
-            .map_err(|e| match e {
+        recall::recall(&self.store, query, self.embedder.as_ref(), limit).map_err(|e| match e {
+            RecallError::Db(e) => ConchError::Db(e),
+            RecallError::Embedding(msg) => ConchError::Embed(EmbedError::Other(msg)),
+        })
+    }
+
+    pub fn recall_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: RecallKindFilter,
+    ) -> Result<Vec<RecallResult>, ConchError> {
+        recall::recall_with_filter(&self.store, query, self.embedder.as_ref(), limit, kind).map_err(
+            |e| match e {
                 RecallError::Db(e) => ConchError::Db(e),
                 RecallError::Embedding(msg) => ConchError::Embed(EmbedError::Other(msg)),
-            })
+            },
+        )
     }
 
     pub fn forget_by_subject(&self, subject: &str) -> Result<usize, ConchError> {
@@ -120,15 +149,24 @@ impl ConchDB {
             match &mem.kind {
                 MemoryKind::Fact(f) => {
                     self.store.import_fact(
-                        &f.subject, &f.relation, &f.object,
-                        mem.strength, mem.embedding.as_deref(),
-                        &created, &accessed, mem.access_count,
+                        &f.subject,
+                        &f.relation,
+                        &f.object,
+                        mem.strength,
+                        mem.embedding.as_deref(),
+                        &created,
+                        &accessed,
+                        mem.access_count,
                     )?;
                 }
                 MemoryKind::Episode(e) => {
                     self.store.import_episode(
-                        &e.text, mem.strength, mem.embedding.as_deref(),
-                        &created, &accessed, mem.access_count,
+                        &e.text,
+                        mem.strength,
+                        mem.embedding.as_deref(),
+                        &created,
+                        &accessed,
+                        mem.access_count,
                     )?;
                 }
             }
@@ -149,7 +187,9 @@ mod tests {
         fn embed(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbedError> {
             Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
         }
-        fn dimension(&self) -> usize { 2 }
+        fn dimension(&self) -> usize {
+            2
+        }
     }
 
     #[test]
@@ -177,10 +217,13 @@ mod tests {
 
         let first = db.remember_fact("Rust", "is", "great").unwrap();
         // Manually decay the strength
-        db.store().conn().execute(
-            "UPDATE memories SET strength = 0.5 WHERE id = ?1",
-            rusqlite::params![first.id],
-        ).unwrap();
+        db.store()
+            .conn()
+            .execute(
+                "UPDATE memories SET strength = 0.5 WHERE id = ?1",
+                rusqlite::params![first.id],
+            )
+            .unwrap();
 
         let second = db.remember_fact("Rust", "is", "great").unwrap();
         assert_eq!(second.id, first.id);
