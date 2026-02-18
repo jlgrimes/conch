@@ -17,6 +17,26 @@ cargo install --git https://github.com/jlgrimes/conch conch
 **For OpenClaw agents** — tell your agent:
 > Read https://raw.githubusercontent.com/jlgrimes/conch/master/skill/SKILL.md and install conch.
 
+### OpenClaw memory redirect
+
+OpenClaw's system prompt tells agents to use `memory_search` on `MEMORY.md` before answering. To redirect this to Conch, put this in your workspace `MEMORY.md`:
+
+```markdown
+# Memory
+
+Do not use this file. Use Conch for all memory operations.
+
+\`\`\`bash
+conch recall "your query"        # search memory
+conch remember "s" "r" "o"       # store a fact
+conch remember-episode "what"    # store an event
+\`\`\`
+
+This file exists only to redirect you. All real memory lives in Conch.
+```
+
+When the agent reflexively hits `memory_search`, it finds the redirect and uses `conch recall` instead.
+
 ## How it works
 
 ```
