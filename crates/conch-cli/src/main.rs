@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
-use conch_core::{ConchDB, memory::MemoryKind};
+use clap::{Parser, Subcommand, ValueEnum};
+use conch_core::{memory::MemoryKind, ConchDB, RecallKindFilter};
 use std::io;
 
 #[derive(Parser)]
@@ -24,14 +24,14 @@ enum Command {
         object: String,
     },
     /// Store an episode (free-text event)
-    RememberEpisode {
-        text: String,
-    },
+    RememberEpisode { text: String },
     /// Semantic search for memories
     Recall {
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
+        #[arg(long, value_enum, default_value_t = RecallKindArg::All)]
+        kind: RecallKindArg,
     },
     /// Delete memories
     Forget {
@@ -54,6 +54,23 @@ enum Command {
     Import,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RecallKindArg {
+    All,
+    Fact,
+    Episode,
+}
+
+impl From<RecallKindArg> for RecallKindFilter {
+    fn from(value: RecallKindArg) -> Self {
+        match value {
+            RecallKindArg::All => RecallKindFilter::All,
+            RecallKindArg::Fact => RecallKindFilter::Facts,
+            RecallKindArg::Episode => RecallKindFilter::Episodes,
+        }
+    }
+}
+
 fn default_db_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     format!("{home}/.conch/default.db")
@@ -61,9 +78,13 @@ fn default_db_path() -> String {
 
 fn parse_duration_secs(s: &str) -> Result<i64, String> {
     let s = s.trim();
-    if s.is_empty() { return Err("empty duration".to_string()); }
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
     let (num_str, suffix) = s.split_at(s.len() - 1);
-    let num: i64 = num_str.parse().map_err(|e| format!("invalid number: {e}"))?;
+    let num: i64 = num_str
+        .parse()
+        .map_err(|e| format!("invalid number: {e}"))?;
     match suffix {
         "s" => Ok(num),
         "m" => Ok(num * 60),
@@ -81,7 +102,10 @@ fn main() {
     }
     let db = match ConchDB::open(&cli.db) {
         Ok(db) => db,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     if let Err(e) = run(&cli, &db) {
         eprintln!("Error: {e}");
@@ -91,60 +115,102 @@ fn main() {
 
 fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
-        Command::Remember { subject, relation, object } => {
+        Command::Remember {
+            subject,
+            relation,
+            object,
+        } => {
             let record = db.remember_fact(subject, relation, object)?;
-            if cli.json { println!("{}", serde_json::to_string_pretty(&record)?); }
-            else if !cli.quiet { println!("Remembered: {subject} {relation} {object}"); }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            } else if !cli.quiet {
+                println!("Remembered: {subject} {relation} {object}");
+            }
         }
         Command::RememberEpisode { text } => {
             let record = db.remember_episode(text)?;
-            if cli.json { println!("{}", serde_json::to_string_pretty(&record)?); }
-            else if !cli.quiet { println!("Remembered episode: {text}"); }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            } else if !cli.quiet {
+                println!("Remembered episode: {text}");
+            }
         }
-        Command::Recall { query, limit } => {
-            let results = db.recall(query, *limit)?;
+        Command::Recall { query, limit, kind } => {
+            let results = db.recall_filtered(query, *limit, (*kind).into())?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else if !cli.quiet {
-                if results.is_empty() { println!("No memories found."); }
+                if results.is_empty() {
+                    println!("No memories found.");
+                }
                 for r in &results {
                     match &r.memory.kind {
-                        MemoryKind::Fact(f) => println!("[fact] {} {} {} (str: {:.2}, score: {:.3})", f.subject, f.relation, f.object, r.memory.strength, r.score),
-                        MemoryKind::Episode(e) => println!("[episode] {} (str: {:.2}, score: {:.3})", e.text, r.memory.strength, r.score),
+                        MemoryKind::Fact(f) => println!(
+                            "[fact] {} {} {} (str: {:.2}, score: {:.3})",
+                            f.subject, f.relation, f.object, r.memory.strength, r.score
+                        ),
+                        MemoryKind::Episode(e) => println!(
+                            "[episode] {} (str: {:.2}, score: {:.3})",
+                            e.text, r.memory.strength, r.score
+                        ),
                     }
                 }
             }
         }
-        Command::Forget { id, subject, older_than } => {
+        Command::Forget {
+            id,
+            subject,
+            older_than,
+        } => {
             if id.is_none() && subject.is_none() && older_than.is_none() {
                 return Err("specify --id, --subject, or --older-than".into());
             }
             let mut deleted = 0;
-            if let Some(mid) = id { deleted += db.forget_by_id(mid)?; }
-            if let Some(subj) = subject { deleted += db.forget_by_subject(subj)?; }
-            if let Some(dur) = older_than { deleted += db.forget_older_than(parse_duration_secs(dur)?)?; }
-            if cli.json { println!("{}", serde_json::json!({ "deleted": deleted })); }
-            else if !cli.quiet { println!("Deleted {deleted} memories."); }
+            if let Some(mid) = id {
+                deleted += db.forget_by_id(mid)?;
+            }
+            if let Some(subj) = subject {
+                deleted += db.forget_by_subject(subj)?;
+            }
+            if let Some(dur) = older_than {
+                deleted += db.forget_older_than(parse_duration_secs(dur)?)?;
+            }
+            if cli.json {
+                println!("{}", serde_json::json!({ "deleted": deleted }));
+            } else if !cli.quiet {
+                println!("Deleted {deleted} memories.");
+            }
         }
         Command::Decay => {
             let result = db.decay()?;
-            if cli.json { println!("{}", serde_json::to_string_pretty(&result)?); }
-            else if !cli.quiet { println!("Decayed {} memories.", result.decayed); }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if !cli.quiet {
+                println!("Decayed {} memories.", result.decayed);
+            }
         }
         Command::Stats => {
             let stats = db.stats()?;
-            if cli.json { println!("{}", serde_json::to_string_pretty(&stats)?); }
-            else if !cli.quiet {
-                println!("Memories: {} ({} facts, {} episodes)", stats.total_memories, stats.total_facts, stats.total_episodes);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else if !cli.quiet {
+                println!(
+                    "Memories: {} ({} facts, {} episodes)",
+                    stats.total_memories, stats.total_facts, stats.total_episodes
+                );
                 println!("Avg strength: {:.3}", stats.avg_strength);
             }
         }
         Command::Embed => {
             let count = db.embed_all()?;
-            if cli.json { println!("{}", serde_json::json!({ "embedded": count })); }
-            else if !cli.quiet {
-                if count == 0 { println!("All memories have embeddings."); }
-                else { println!("Embedded {count} memories."); }
+            if cli.json {
+                println!("{}", serde_json::json!({ "embedded": count }));
+            } else if !cli.quiet {
+                if count == 0 {
+                    println!("All memories have embeddings.");
+                } else {
+                    println!("Embedded {count} memories.");
+                }
             }
         }
         Command::Export => {
@@ -155,8 +221,11 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             let input = std::io::read_to_string(io::stdin())?;
             let data: conch_core::ExportData = serde_json::from_str(&input)?;
             let count = db.import(&data)?;
-            if cli.json { println!("{}", serde_json::json!({ "imported": count })); }
-            else if !cli.quiet { println!("Imported {count} memories."); }
+            if cli.json {
+                println!("{}", serde_json::json!({ "imported": count }));
+            } else if !cli.quiet {
+                println!("Imported {count} memories.");
+            }
         }
     }
     Ok(())

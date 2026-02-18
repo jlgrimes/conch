@@ -1,4 +1,4 @@
-use conch_core::{ConchDB, MemoryKind, RecallResult};
+use conch_core::{ConchDB, MemoryKind, RecallKindFilter, RecallResult};
 use rmcp::{
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -26,12 +26,24 @@ struct RememberEpisodeParams {
 struct RecallParams {
     query: String,
     limit: Option<usize>,
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ForgetParams {
     subject: Option<String>,
     older_than_secs: Option<i64>,
+}
+
+fn parse_recall_kind(kind: Option<&str>) -> Result<RecallKindFilter, String> {
+    match kind.unwrap_or("all").to_ascii_lowercase().as_str() {
+        "all" => Ok(RecallKindFilter::All),
+        "fact" => Ok(RecallKindFilter::Facts),
+        "episode" => Ok(RecallKindFilter::Episodes),
+        other => Err(format!(
+            "invalid kind '{other}'. Expected one of: all, fact, episode"
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -54,12 +66,16 @@ struct MemoryResponse {
 impl From<RecallResult> for MemoryResponse {
     fn from(r: RecallResult) -> Self {
         let (kind, content) = match &r.memory.kind {
-            MemoryKind::Fact(f) => ("fact".into(), format!("{} {} {}", f.subject, f.relation, f.object)),
+            MemoryKind::Fact(f) => (
+                "fact".into(),
+                format!("{} {} {}", f.subject, f.relation, f.object),
+            ),
             MemoryKind::Episode(e) => ("episode".into(), e.text.clone()),
         };
         MemoryResponse {
             id: r.memory.id,
-            kind, content,
+            kind,
+            content,
             strength: r.memory.strength,
             score: r.score,
             created_at: r.memory.created_at.to_rfc3339(),
@@ -78,11 +94,20 @@ struct ConchServer {
 #[tool_router]
 impl ConchServer {
     fn new(conch: ConchDB) -> Self {
-        Self { conch: Arc::new(Mutex::new(conch)), tool_router: Self::tool_router() }
+        Self {
+            conch: Arc::new(Mutex::new(conch)),
+            tool_router: Self::tool_router(),
+        }
     }
 
-    #[tool(name = "remember_fact", description = "Store a fact as a subject-relation-object triple.")]
-    async fn remember_fact(&self, params: Parameters<RememberFactParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "remember_fact",
+        description = "Store a fact as a subject-relation-object triple."
+    )]
+    async fn remember_fact(
+        &self,
+        params: Parameters<RememberFactParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = self.conch.lock().unwrap();
         match conch.remember_fact(&p.subject, &p.relation, &p.object) {
@@ -93,8 +118,14 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "remember_episode", description = "Store a free-text episode or event.")]
-    async fn remember_episode(&self, params: Parameters<RememberEpisodeParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "remember_episode",
+        description = "Store a free-text episode or event."
+    )]
+    async fn remember_episode(
+        &self,
+        params: Parameters<RememberEpisodeParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = self.conch.lock().unwrap();
         match conch.remember_episode(&p.text) {
@@ -105,13 +136,21 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "recall", description = "Search memories using natural language. BM25 + vector search, ranked by relevance × strength × recency.")]
+    #[tool(
+        name = "recall",
+        description = "Search memories using natural language. BM25 + vector search, ranked by relevance × strength × recency."
+    )]
     async fn recall(&self, params: Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        let kind = match parse_recall_kind(p.kind.as_deref()) {
+            Ok(kind) => kind,
+            Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg)])),
+        };
         let conch = self.conch.lock().unwrap();
-        match conch.recall(&p.query, p.limit.unwrap_or(5)) {
+        match conch.recall_filtered(&p.query, p.limit.unwrap_or(5), kind) {
             Ok(results) => {
-                let responses: Vec<MemoryResponse> = results.into_iter().map(MemoryResponse::from).collect();
+                let responses: Vec<MemoryResponse> =
+                    results.into_iter().map(MemoryResponse::from).collect();
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&responses).unwrap(),
                 )]))
@@ -124,34 +163,57 @@ impl ConchServer {
     async fn forget(&self, params: Parameters<ForgetParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         if p.subject.is_none() && p.older_than_secs.is_none() {
-            return Ok(CallToolResult::error(vec![Content::text("Provide 'subject' or 'older_than_secs'".to_string())]));
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Provide 'subject' or 'older_than_secs'".to_string(),
+            )]));
         }
         let conch = self.conch.lock().unwrap();
         let mut total = 0;
         if let Some(subject) = &p.subject {
-            match conch.forget_by_subject(subject) { Ok(n) => total += n, Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])) }
+            match conch.forget_by_subject(subject) {
+                Ok(n) => total += n,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            }
         }
         if let Some(secs) = p.older_than_secs {
-            match conch.forget_older_than(secs) { Ok(n) => total += n, Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])) }
+            match conch.forget_older_than(secs) {
+                Ok(n) => total += n,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            }
         }
-        Ok(CallToolResult::success(vec![Content::text(serde_json::json!({ "forgotten": total }).to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::json!({ "forgotten": total }).to_string(),
+        )]))
     }
 
-    #[tool(name = "forget_by_id", description = "Delete a specific memory by its ID.")]
-    async fn forget_by_id(&self, params: Parameters<ForgetByIdParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "forget_by_id",
+        description = "Delete a specific memory by its ID."
+    )]
+    async fn forget_by_id(
+        &self,
+        params: Parameters<ForgetByIdParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = self.conch.lock().unwrap();
         match conch.forget_by_id(&p.id) {
-            Ok(n) => Ok(CallToolResult::success(vec![Content::text(serde_json::json!({ "forgotten": n }).to_string())])),
+            Ok(n) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({ "forgotten": n }).to_string(),
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
 
-    #[tool(name = "decay", description = "Run decay pass. Memories lose strength over time; weak ones are pruned.")]
+    #[tool(
+        name = "decay",
+        description = "Run decay pass. Memories lose strength over time; weak ones are pruned."
+    )]
     async fn decay(&self) -> Result<CallToolResult, McpError> {
         let conch = self.conch.lock().unwrap();
         match conch.decay() {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&result).unwrap())])),
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap(),
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
@@ -160,7 +222,9 @@ impl ConchServer {
     async fn stats(&self) -> Result<CallToolResult, McpError> {
         let conch = self.conch.lock().unwrap();
         match conch.stats() {
-            Ok(stats) => Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&stats).unwrap())])),
+            Ok(stats) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&stats).unwrap(),
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
