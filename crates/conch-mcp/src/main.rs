@@ -34,6 +34,11 @@ struct ForgetParams {
     older_than_secs: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ForgetByIdParams {
+    id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct MemoryResponse {
     id: i64,
@@ -130,6 +135,16 @@ impl ConchServer {
             match conch.forget_older_than(secs) { Ok(n) => total += n, Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])) }
         }
         Ok(CallToolResult::success(vec![Content::text(serde_json::json!({ "forgotten": total }).to_string())]))
+    }
+
+    #[tool(name = "forget_by_id", description = "Delete a specific memory by its ID.")]
+    async fn forget_by_id(&self, params: Parameters<ForgetByIdParams>) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let conch = self.conch.lock().unwrap();
+        match conch.forget_by_id(&p.id) {
+            Ok(n) => Ok(CallToolResult::success(vec![Content::text(serde_json::json!({ "forgotten": n }).to_string())])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
     }
 
     #[tool(name = "decay", description = "Run decay pass. Memories lose strength over time; weak ones are pruned.")]
