@@ -98,6 +98,9 @@ Defaults:
 conch remember <subject> <relation> <object>   # store a fact
 conch remember-episode <text>                   # store an event
 conch recall <query> [--limit N]               # semantic search
+conch recall <query> --kind all                # search facts + episodes (default)
+conch recall <query> --kind fact               # search only facts
+conch recall <query> --kind episode            # search only episodes
 conch forget --id <id>                          # delete by ID
 conch forget --subject <name>                   # delete by subject
 conch forget --older-than <duration>            # prune old (e.g. 30d)
