@@ -184,6 +184,18 @@ Single SQLite file at `~/.conch/default.db`. Override with `--db <path>`.
 
 - Testing guide: [`docs/testing.md`](docs/testing.md) (includes MCP concurrency regression coverage and `conch-mcp` test command)
 - Roadmap / market landscape: [`docs/market-landscape-2026-02.md`](docs/market-landscape-2026-02.md)
+- MCP critical test triage: [`docs/mcp-critical-test-triage.md`](docs/mcp-critical-test-triage.md) (failure response guide)
+
+## CI Reliability Gate
+
+CI includes a dedicated `mcp-critical` job that runs 4 critical reliability tests before any other tests:
+
+1. **Concurrency safety** — `concurrent_mixed_remember_and_recall_regression`
+2. **Lock poisoning recovery** — `lock_conch_returns_error_when_poisoned`  
+3. **Input validation** — `forget_rejects_negative_older_than_secs_and_does_not_delete`
+4. **Namespace isolation** — `namespace_falls_back_to_server_default`
+
+These tests prevent data corruption, race conditions, and other critical failures. The main test suite only runs after these pass. See [`docs/mcp-critical-test-triage.md`](docs/mcp-critical-test-triage.md) for failure triage guidance.
 
 ## License
 

@@ -19,17 +19,29 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
 
-  mcp-regression:
-    name: mcp concurrency regression
+  mcp-critical:
+    name: mcp critical reliability tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p conch-mcp concurrent_mixed_remember_and_recall_regression
+      - name: Run MCP critical reliability tests
+        run: |
+          echo "Running MCP critical reliability test suite..."
+          # Concurrency safety - prevents race conditions and data corruption
+          cargo test -p conch-mcp concurrent_mixed_remember_and_recall_regression
+          # Lock poisoning recovery - prevents cascading failures
+          cargo test -p conch-mcp lock_conch_returns_error_when_poisoned
+          # Input validation - prevents accidental mass deletion
+          cargo test -p conch-mcp forget_rejects_negative_older_than_secs_and_does_not_delete
+          # Namespace isolation - prevents cross-namespace data leaks
+          cargo test -p conch-mcp namespace_falls_back_to_server_default
+          echo "All MCP critical tests passed ✅"
 
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: mcp-critical  # Require critical tests to pass first
     strategy:
       fail-fast: false
       matrix:
