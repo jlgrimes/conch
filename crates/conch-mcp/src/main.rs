@@ -8,6 +8,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -61,6 +62,16 @@ fn lock_conch<'a>(
     })
 }
 
+fn success_json(value: Value) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(value.to_string())])
+}
+
+fn success_json_pretty<T: Serialize>(value: &T) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(value).expect("serialization should not fail"),
+    )])
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ForgetByIdParams {
     namespace: Option<String>,
@@ -75,6 +86,7 @@ struct NamespaceParams {
 #[derive(Debug, Serialize)]
 struct MemoryResponse {
     id: i64,
+    namespace: String,
     kind: String,
     content: String,
     strength: f64,
@@ -110,6 +122,7 @@ impl From<RecallResult> for MemoryResponse {
         let explanation = r.explanation;
         MemoryResponse {
             id: r.memory.id,
+            namespace: r.memory.namespace.clone(),
             kind,
             content,
             strength: r.memory.strength,
@@ -149,6 +162,16 @@ impl ConchServer {
         namespace.unwrap_or(self.default_namespace.as_str())
     }
 
+    fn with_conch<R>(
+        &self,
+        f: impl FnOnce(&ConchDB) -> Result<R, String>,
+    ) -> Result<Result<R, CallToolResult>, McpError> {
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(Err(result)),
+        };
+        Ok(f(&conch).map_err(|msg| CallToolResult::error(vec![Content::text(msg)])))
+    }
     #[tool(
         name = "remember_fact",
         description = "Store a fact as a subject-relation-object triple."
@@ -159,15 +182,15 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = self.namespace_or_default(p.namespace.as_deref());
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
-        match conch.remember_fact_in(namespace, &p.subject, &p.relation, &p.object) {
-            Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        match self.with_conch(|conch| {
+            conch
+                .remember_fact_in(namespace, &p.subject, &p.relation, &p.object)
+                .map_err(|e| e.to_string())
+        })? {
+            Ok(mem) => Ok(success_json(
+                serde_json::json!({ "id": mem.id, "strength": mem.strength, "namespace": namespace }),
+            )),
+            Err(error) => Ok(error),
         }
     }
 
@@ -181,15 +204,15 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = self.namespace_or_default(p.namespace.as_deref());
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
-        match conch.remember_episode_in(namespace, &p.text) {
-            Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        match self.with_conch(|conch| {
+            conch
+                .remember_episode_in(namespace, &p.text)
+                .map_err(|e| e.to_string())
+        })? {
+            Ok(mem) => Ok(success_json(
+                serde_json::json!({ "id": mem.id, "strength": mem.strength, "namespace": namespace }),
+            )),
+            Err(error) => Ok(error),
         }
     }
 
@@ -204,27 +227,25 @@ impl ConchServer {
             Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg)])),
         };
         let namespace = self.namespace_or_default(p.namespace.as_deref());
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
-        match conch.recall_filtered_in_with_options(
-            namespace,
-            &p.query,
-            p.limit.unwrap_or(5),
-            kind,
-            RecallOptions {
-                explain: p.explain.unwrap_or(false),
-            },
-        ) {
+        match self.with_conch(|conch| {
+            conch
+                .recall_filtered_in_with_options(
+                    namespace,
+                    &p.query,
+                    p.limit.unwrap_or(5),
+                    kind,
+                    RecallOptions {
+                        explain: p.explain.unwrap_or(false),
+                    },
+                )
+                .map_err(|e| e.to_string())
+        })? {
             Ok(results) => {
                 let responses: Vec<MemoryResponse> =
                     results.into_iter().map(MemoryResponse::from).collect();
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&responses).unwrap(),
-                )]))
+                Ok(success_json_pretty(&responses))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            Err(error) => Ok(error),
         }
     }
 
@@ -237,26 +258,25 @@ impl ConchServer {
             )]));
         }
         let namespace = self.namespace_or_default(p.namespace.as_deref());
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
-        let mut total = 0;
-        if let Some(subject) = &p.subject {
-            match conch.forget_by_subject_in(namespace, subject) {
-                Ok(n) => total += n,
-                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        match self.with_conch(|conch| {
+            let mut total = 0;
+            if let Some(subject) = &p.subject {
+                total += conch
+                    .forget_by_subject_in(namespace, subject)
+                    .map_err(|e| e.to_string())?;
             }
-        }
-        if let Some(secs) = p.older_than_secs {
-            match conch.forget_older_than_in(namespace, secs) {
-                Ok(n) => total += n,
-                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            if let Some(secs) = p.older_than_secs {
+                total += conch
+                    .forget_older_than_in(namespace, secs)
+                    .map_err(|e| e.to_string())?;
             }
+            Ok(total)
+        })? {
+            Ok(total) => Ok(success_json(
+                serde_json::json!({ "forgotten": total, "namespace": namespace }),
+            )),
+            Err(error) => Ok(error),
         }
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::json!({ "forgotten": total }).to_string(),
-        )]))
     }
 
     #[tool(
@@ -269,15 +289,15 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = self.namespace_or_default(p.namespace.as_deref());
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
-        match conch.forget_by_id_in(namespace, &p.id) {
-            Ok(n) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::json!({ "forgotten": n }).to_string(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        match self.with_conch(|conch| {
+            conch
+                .forget_by_id_in(namespace, &p.id)
+                .map_err(|e| e.to_string())
+        })? {
+            Ok(n) => Ok(success_json(
+                serde_json::json!({ "forgotten": n, "namespace": namespace }),
+            )),
+            Err(error) => Ok(error),
         }
     }
 
@@ -288,15 +308,13 @@ impl ConchServer {
     async fn decay(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = self.namespace_or_default(p.namespace.as_deref());
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
-        match conch.decay_in(namespace) {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        match self.with_conch(|conch| conch.decay_in(namespace).map_err(|e| e.to_string()))? {
+            Ok(result) => Ok(success_json(serde_json::json!({
+                "namespace": namespace,
+                "decayed": result.decayed,
+                "deleted": result.deleted
+            }))),
+            Err(error) => Ok(error),
         }
     }
 
@@ -304,15 +322,15 @@ impl ConchServer {
     async fn stats(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = self.namespace_or_default(p.namespace.as_deref());
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
-        match conch.stats_in(namespace) {
-            Ok(stats) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&stats).unwrap(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        match self.with_conch(|conch| conch.stats_in(namespace).map_err(|e| e.to_string()))? {
+            Ok(stats) => Ok(success_json(serde_json::json!({
+                "namespace": namespace,
+                "total_memories": stats.total_memories,
+                "total_facts": stats.total_facts,
+                "total_episodes": stats.total_episodes,
+                "avg_strength": stats.avg_strength
+            }))),
+            Err(error) => Ok(error),
         }
     }
 }
@@ -388,6 +406,51 @@ mod tests {
 
         assert_eq!(server.namespace_or_default(None), "team-a");
         assert_eq!(server.namespace_or_default(Some("team-b")), "team-b");
+    }
+
+    fn tool_result_json_text(result: &CallToolResult) -> serde_json::Value {
+        let outer = serde_json::to_value(result).expect("serialize tool result");
+        let text = outer["content"][0]["text"]
+            .as_str()
+            .expect("text content payload");
+        serde_json::from_str(text).expect("inner json payload")
+    }
+
+    #[tokio::test]
+    async fn remember_fact_success_includes_namespace() {
+        let db = ConchDB::open_in_memory_with(Box::new(NoopEmbedder)).expect("db");
+        let server = ConchServer::new(db, "default-ns".to_string());
+
+        let result = server
+            .remember_fact(Parameters(RememberFactParams {
+                namespace: Some("team-a".to_string()),
+                subject: "sky".to_string(),
+                relation: "is".to_string(),
+                object: "blue".to_string(),
+            }))
+            .await
+            .expect("tool call should succeed");
+
+        let value = tool_result_json_text(&result);
+        assert_eq!(value["namespace"], "team-a");
+        assert!(value["id"].is_number());
+    }
+
+    #[tokio::test]
+    async fn stats_success_includes_namespace() {
+        let db = ConchDB::open_in_memory_with(Box::new(NoopEmbedder)).expect("db");
+        let server = ConchServer::new(db, "default-ns".to_string());
+
+        let result = server
+            .stats(Parameters(NamespaceParams {
+                namespace: Some("team-b".to_string()),
+            }))
+            .await
+            .expect("tool call should succeed");
+
+        let value = tool_result_json_text(&result);
+        assert_eq!(value["namespace"], "team-b");
+        assert!(value["total_memories"].is_number());
     }
 }
 
