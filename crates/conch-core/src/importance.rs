@@ -122,6 +122,8 @@ mod tests {
             session_id: None,
             channel: None,
             importance: 0.5,
+            namespace: "default".to_string(),
+            checksum: None,
         }
     }
 

@@ -75,7 +75,18 @@ pub fn recall_with_tag_filter(
     limit: usize,
     tag_filter: Option<&str>,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let mut all_memories = store.all_memories_with_text().map_err(RecallError::Db)?;
+    recall_with_tag_filter_ns(store, query, embedder, limit, tag_filter, "default")
+}
+
+pub fn recall_with_tag_filter_ns(
+    store: &MemoryStore,
+    query: &str,
+    embedder: &dyn Embedder,
+    limit: usize,
+    tag_filter: Option<&str>,
+    namespace: &str,
+) -> Result<Vec<RecallResult>, RecallError> {
+    let mut all_memories = store.all_memories_with_text_ns(namespace).map_err(RecallError::Db)?;
 
     // If a tag filter is specified, only keep memories that have the tag.
     if let Some(tag) = tag_filter {
@@ -726,6 +737,8 @@ mod tests {
             session_id: None,
             channel: None,
             importance: 0.5,
+            namespace: "default".to_string(),
+            checksum: None,
         }
     }
 
@@ -745,6 +758,8 @@ mod tests {
             session_id: None,
             channel: None,
             importance: 0.5,
+            namespace: "default".to_string(),
+            checksum: None,
         }
     }
 
