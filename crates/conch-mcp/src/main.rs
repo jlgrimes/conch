@@ -52,6 +52,7 @@ fn parse_recall_kind(kind: Option<&str>) -> Result<RecallKindFilter, String> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ForgetByIdParams {
+    namespace: Option<String>,
     id: String,
 }
 
@@ -208,8 +209,9 @@ impl ConchServer {
         params: Parameters<ForgetByIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        let namespace = p.namespace.as_deref().unwrap_or("default");
         let conch = self.conch.lock().unwrap();
-        match conch.forget_by_id(&p.id) {
+        match conch.forget_by_id_in(namespace, &p.id) {
             Ok(n) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "forgotten": n }).to_string(),
             )])),

@@ -169,7 +169,7 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             }
             let mut deleted = 0;
             if let Some(mid) = id {
-                deleted += db.forget_by_id(mid)?;
+                deleted += db.forget_by_id_in(&cli.namespace, mid)?;
             }
             if let Some(subj) = subject {
                 deleted += db.forget_by_subject_in(&cli.namespace, subj)?;
