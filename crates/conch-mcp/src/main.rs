@@ -8,7 +8,8 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RememberFactParams {
@@ -120,7 +121,7 @@ impl From<RecallResult> for MemoryResponse {
 
 #[derive(Clone)]
 struct ConchServer {
-    conch: Arc<Mutex<ConchDB>>,
+    conch: Arc<RwLock<ConchDB>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -128,7 +129,7 @@ struct ConchServer {
 impl ConchServer {
     fn new(conch: ConchDB) -> Self {
         Self {
-            conch: Arc::new(Mutex::new(conch)),
+            conch: Arc::new(RwLock::new(conch)),
             tool_router: Self::tool_router(),
         }
     }
@@ -143,7 +144,7 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.lock().unwrap();
+        let conch = self.conch.write().await;
         match conch.remember_fact_in(namespace, &p.subject, &p.relation, &p.object) {
             Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
@@ -162,7 +163,7 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.lock().unwrap();
+        let conch = self.conch.write().await;
         match conch.remember_episode_in(namespace, &p.text) {
             Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
@@ -182,7 +183,7 @@ impl ConchServer {
             Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg)])),
         };
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.lock().unwrap();
+        let conch = self.conch.read().await;
         match conch.recall_filtered_in_with_options(
             namespace,
             &p.query,
@@ -212,7 +213,7 @@ impl ConchServer {
             )]));
         }
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.lock().unwrap();
+        let conch = self.conch.write().await;
         let mut total = 0;
         if let Some(subject) = &p.subject {
             match conch.forget_by_subject_in(namespace, subject) {
@@ -241,7 +242,7 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.lock().unwrap();
+        let conch = self.conch.write().await;
         match conch.forget_by_id_in(namespace, &p.id) {
             Ok(n) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "forgotten": n }).to_string(),
@@ -257,7 +258,7 @@ impl ConchServer {
     async fn decay(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.lock().unwrap();
+        let conch = self.conch.write().await;
         match conch.decay_in(namespace) {
             Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&result).unwrap(),
@@ -270,7 +271,7 @@ impl ConchServer {
     async fn stats(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.lock().unwrap();
+        let conch = self.conch.read().await;
         match conch.stats_in(namespace) {
             Ok(stats) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&stats).unwrap(),
@@ -297,6 +298,32 @@ impl ServerHandler for ConchServer {
             },
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_recall_kind_rejects_invalid_kind() {
+        let err = parse_recall_kind(Some("bogus")).expect_err("invalid kind should error");
+        assert!(err.contains("invalid kind"));
+    }
+
+    #[tokio::test]
+    async fn rwlock_recovers_after_task_panic() {
+        let lock = Arc::new(RwLock::new(42_u32));
+        let lock_for_panic = Arc::clone(&lock);
+
+        let join = tokio::spawn(async move {
+            let _guard = lock_for_panic.write().await;
+            panic!("simulated panic while lock held");
+        });
+        assert!(join.await.is_err());
+
+        let guard = lock.read().await;
+        assert_eq!(*guard, 42);
     }
 }
 

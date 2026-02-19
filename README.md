@@ -139,6 +139,7 @@ conch-mcp
 ```
 
 Set `CONCH_DB` to customize the database path (default: `~/.conch/default.db`).
+The MCP server uses async `tokio` locks internally to avoid panic-on-poison behavior and reduce head-of-line blocking under concurrent tool calls.
 
 ### Available tools
 
@@ -153,6 +154,8 @@ Set `CONCH_DB` to customize the database path (default: `~/.conch/default.db`).
 | `stats` | Memory statistics |
 
 All relevant MCP tools accept an optional `namespace` field (default: `"default"`).
+
+`conch-mcp` uses an async `tokio::sync::RwLock` internally (read locks for `recall`/`stats`, write locks for mutating tools) to avoid poisoned-lock panics and reduce async head-of-line blocking.
 
 ## Scoring
 
