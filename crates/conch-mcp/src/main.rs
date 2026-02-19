@@ -131,16 +131,22 @@ impl From<RecallResult> for MemoryResponse {
 #[derive(Clone)]
 struct ConchServer {
     conch: Arc<Mutex<ConchDB>>,
+    default_namespace: String,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ConchServer {
-    fn new(conch: ConchDB) -> Self {
+    fn new(conch: ConchDB, default_namespace: String) -> Self {
         Self {
             conch: Arc::new(Mutex::new(conch)),
+            default_namespace,
             tool_router: Self::tool_router(),
         }
+    }
+
+    fn namespace_or_default<'a>(&'a self, namespace: Option<&'a str>) -> &'a str {
+        namespace.unwrap_or(self.default_namespace.as_str())
     }
 
     #[tool(
@@ -152,7 +158,7 @@ impl ConchServer {
         params: Parameters<RememberFactParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = p.namespace.as_deref().unwrap_or("default");
+        let namespace = self.namespace_or_default(p.namespace.as_deref());
         let conch = match lock_conch(&self.conch) {
             Ok(guard) => guard,
             Err(result) => return Ok(result),
@@ -174,7 +180,7 @@ impl ConchServer {
         params: Parameters<RememberEpisodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = p.namespace.as_deref().unwrap_or("default");
+        let namespace = self.namespace_or_default(p.namespace.as_deref());
         let conch = match lock_conch(&self.conch) {
             Ok(guard) => guard,
             Err(result) => return Ok(result),
@@ -197,7 +203,7 @@ impl ConchServer {
             Ok(kind) => kind,
             Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg)])),
         };
-        let namespace = p.namespace.as_deref().unwrap_or("default");
+        let namespace = self.namespace_or_default(p.namespace.as_deref());
         let conch = match lock_conch(&self.conch) {
             Ok(guard) => guard,
             Err(result) => return Ok(result),
@@ -230,7 +236,7 @@ impl ConchServer {
                 "Provide 'subject' or 'older_than_secs'".to_string(),
             )]));
         }
-        let namespace = p.namespace.as_deref().unwrap_or("default");
+        let namespace = self.namespace_or_default(p.namespace.as_deref());
         let conch = match lock_conch(&self.conch) {
             Ok(guard) => guard,
             Err(result) => return Ok(result),
@@ -262,7 +268,7 @@ impl ConchServer {
         params: Parameters<ForgetByIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = p.namespace.as_deref().unwrap_or("default");
+        let namespace = self.namespace_or_default(p.namespace.as_deref());
         let conch = match lock_conch(&self.conch) {
             Ok(guard) => guard,
             Err(result) => return Ok(result),
@@ -281,7 +287,7 @@ impl ConchServer {
     )]
     async fn decay(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = p.namespace.as_deref().unwrap_or("default");
+        let namespace = self.namespace_or_default(p.namespace.as_deref());
         let conch = match lock_conch(&self.conch) {
             Ok(guard) => guard,
             Err(result) => return Ok(result),
@@ -297,7 +303,7 @@ impl ConchServer {
     #[tool(name = "stats", description = "Get memory statistics.")]
     async fn stats(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = p.namespace.as_deref().unwrap_or("default");
+        let namespace = self.namespace_or_default(p.namespace.as_deref());
         let conch = match lock_conch(&self.conch) {
             Ok(guard) => guard,
             Err(result) => return Ok(result),
@@ -374,6 +380,15 @@ mod tests {
             "poisoned lock should produce tool error, not panic"
         );
     }
+
+    #[test]
+    fn namespace_falls_back_to_server_default() {
+        let db = ConchDB::open_in_memory_with(Box::new(NoopEmbedder)).expect("db");
+        let server = ConchServer::new(db, "team-a".to_string());
+
+        assert_eq!(server.namespace_or_default(None), "team-a");
+        assert_eq!(server.namespace_or_default(Some("team-b")), "team-b");
+    }
 }
 
 #[tokio::main]
@@ -385,10 +400,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    eprintln!("conch-mcp: opening {db_path}");
+    let default_namespace = std::env::var("CONCH_NAMESPACE").unwrap_or_else(|_| "default".into());
+    eprintln!("conch-mcp: opening {db_path} (namespace default: {default_namespace})");
     let conch = ConchDB::open(&db_path)?;
     eprintln!("conch-mcp: ready");
-    let server = ConchServer::new(conch);
+    let server = ConchServer::new(conch, default_namespace);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

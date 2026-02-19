@@ -139,6 +139,7 @@ conch-mcp
 ```
 
 Set `CONCH_DB` to customize the database path (default: `~/.conch/default.db`).
+Set `CONCH_NAMESPACE` to change the default namespace used when MCP tool calls omit `namespace` (default: `default`).
 The MCP server handles lock acquisition failures as tool errors (instead of panicking), improving resilience under lock poisoning scenarios.
 
 ### Available tools
