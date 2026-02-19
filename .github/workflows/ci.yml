@@ -19,6 +19,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
 
+  mcp-regression:
+    name: mcp concurrency regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p conch-mcp concurrent_mixed_remember_and_recall_regression
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
