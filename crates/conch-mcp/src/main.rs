@@ -176,15 +176,26 @@ impl ConchServer {
         namespace.unwrap_or(self.default_namespace.as_str())
     }
 
-    fn with_conch<R>(
-        &self,
-        f: impl FnOnce(&ConchDB) -> Result<R, String>,
-    ) -> Result<Result<R, CallToolResult>, McpError> {
-        let conch = match lock_conch(&self.conch) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(Err(result)),
-        };
-        Ok(f(&conch).map_err(|msg| CallToolResult::error(vec![Content::text(msg)])))
+    async fn with_conch_blocking<R, F>(&self, f: F) -> Result<Result<R, CallToolResult>, McpError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&ConchDB) -> Result<R, String> + Send + 'static,
+    {
+        let conch = Arc::clone(&self.conch);
+        match tokio::task::spawn_blocking(move || {
+            let conch = match lock_conch(&conch) {
+                Ok(guard) => guard,
+                Err(result) => return Err(result),
+            };
+            f(&conch).map_err(|msg| CallToolResult::error(vec![Content::text(msg)]))
+        })
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(_) => Ok(Err(CallToolResult::error(vec![Content::text(
+                "internal error: blocking task failed".to_string(),
+            )]))),
+        }
     }
     #[tool(
         name = "remember_fact",
@@ -195,14 +206,24 @@ impl ConchServer {
         params: Parameters<RememberFactParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = self.namespace_or_default(p.namespace.as_deref());
-        match self.with_conch(|conch| {
-            conch
-                .remember_fact_in(namespace, &p.subject, &p.relation, &p.object)
-                .map_err(|e| e.to_string())
-        })? {
+        let namespace = self
+            .namespace_or_default(p.namespace.as_deref())
+            .to_string();
+        let response_namespace = namespace.clone();
+        let subject = p.subject;
+        let relation = p.relation;
+        let object = p.object;
+
+        match self
+            .with_conch_blocking(move |conch| {
+                conch
+                    .remember_fact_in(&namespace, &subject, &relation, &object)
+                    .map_err(|e| e.to_string())
+            })
+            .await?
+        {
             Ok(mem) => Ok(success_json(
-                serde_json::json!({ "id": mem.id, "strength": mem.strength, "namespace": namespace }),
+                serde_json::json!({ "id": mem.id, "strength": mem.strength, "namespace": response_namespace }),
             )),
             Err(error) => Ok(error),
         }
@@ -217,14 +238,22 @@ impl ConchServer {
         params: Parameters<RememberEpisodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = self.namespace_or_default(p.namespace.as_deref());
-        match self.with_conch(|conch| {
-            conch
-                .remember_episode_in(namespace, &p.text)
-                .map_err(|e| e.to_string())
-        })? {
+        let namespace = self
+            .namespace_or_default(p.namespace.as_deref())
+            .to_string();
+        let response_namespace = namespace.clone();
+        let text = p.text;
+
+        match self
+            .with_conch_blocking(move |conch| {
+                conch
+                    .remember_episode_in(&namespace, &text)
+                    .map_err(|e| e.to_string())
+            })
+            .await?
+        {
             Ok(mem) => Ok(success_json(
-                serde_json::json!({ "id": mem.id, "strength": mem.strength, "namespace": namespace }),
+                serde_json::json!({ "id": mem.id, "strength": mem.strength, "namespace": response_namespace }),
             )),
             Err(error) => Ok(error),
         }
@@ -240,21 +269,31 @@ impl ConchServer {
             Ok(kind) => kind,
             Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg)])),
         };
-        let namespace = self.namespace_or_default(p.namespace.as_deref());
-        match self.with_conch(|conch| {
-            conch
-                .recall_filtered_in_with_options(
-                    namespace,
-                    &p.query,
-                    p.limit.unwrap_or(5),
-                    kind,
-                    RecallOptions {
-                        explain: p.explain.unwrap_or(false),
-                        diagnostics: p.diagnostics.unwrap_or(false),
-                    },
-                )
-                .map_err(|e| e.to_string())
-        })? {
+        let namespace = self
+            .namespace_or_default(p.namespace.as_deref())
+            .to_string();
+        let query = p.query;
+        let limit = p.limit.unwrap_or(5);
+        let explain = p.explain.unwrap_or(false);
+        let diagnostics = p.diagnostics.unwrap_or(false);
+
+        match self
+            .with_conch_blocking(move |conch| {
+                conch
+                    .recall_filtered_in_with_options(
+                        &namespace,
+                        &query,
+                        limit,
+                        kind,
+                        RecallOptions {
+                            explain,
+                            diagnostics,
+                        },
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .await?
+        {
             Ok(results) => {
                 let responses: Vec<MemoryResponse> =
                     results.into_iter().map(MemoryResponse::from).collect();
@@ -272,23 +311,32 @@ impl ConchServer {
                 "Provide 'subject' or 'older_than_secs'".to_string(),
             )]));
         }
-        let namespace = self.namespace_or_default(p.namespace.as_deref());
-        match self.with_conch(|conch| {
-            let mut total = 0;
-            if let Some(subject) = &p.subject {
-                total += conch
-                    .forget_by_subject_in(namespace, subject)
-                    .map_err(|e| e.to_string())?;
-            }
-            if let Some(secs) = p.older_than_secs {
-                total += conch
-                    .forget_older_than_in(namespace, secs)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(total)
-        })? {
+        let namespace = self
+            .namespace_or_default(p.namespace.as_deref())
+            .to_string();
+        let response_namespace = namespace.clone();
+        let subject = p.subject;
+        let older_than_secs = p.older_than_secs;
+
+        match self
+            .with_conch_blocking(move |conch| {
+                let mut total = 0;
+                if let Some(subject) = &subject {
+                    total += conch
+                        .forget_by_subject_in(&namespace, subject)
+                        .map_err(|e| e.to_string())?;
+                }
+                if let Some(secs) = older_than_secs {
+                    total += conch
+                        .forget_older_than_in(&namespace, secs)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(total)
+            })
+            .await?
+        {
             Ok(total) => Ok(success_json(
-                serde_json::json!({ "forgotten": total, "namespace": namespace }),
+                serde_json::json!({ "forgotten": total, "namespace": response_namespace }),
             )),
             Err(error) => Ok(error),
         }
@@ -303,14 +351,22 @@ impl ConchServer {
         params: Parameters<ForgetByIdParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = self.namespace_or_default(p.namespace.as_deref());
-        match self.with_conch(|conch| {
-            conch
-                .forget_by_id_in(namespace, &p.id)
-                .map_err(|e| e.to_string())
-        })? {
+        let namespace = self
+            .namespace_or_default(p.namespace.as_deref())
+            .to_string();
+        let response_namespace = namespace.clone();
+        let id = p.id;
+
+        match self
+            .with_conch_blocking(move |conch| {
+                conch
+                    .forget_by_id_in(&namespace, &id)
+                    .map_err(|e| e.to_string())
+            })
+            .await?
+        {
             Ok(n) => Ok(success_json(
-                serde_json::json!({ "forgotten": n, "namespace": namespace }),
+                serde_json::json!({ "forgotten": n, "namespace": response_namespace }),
             )),
             Err(error) => Ok(error),
         }
@@ -322,10 +378,17 @@ impl ConchServer {
     )]
     async fn decay(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = self.namespace_or_default(p.namespace.as_deref());
-        match self.with_conch(|conch| conch.decay_in(namespace).map_err(|e| e.to_string()))? {
+        let namespace = self
+            .namespace_or_default(p.namespace.as_deref())
+            .to_string();
+        let response_namespace = namespace.clone();
+
+        match self
+            .with_conch_blocking(move |conch| conch.decay_in(&namespace).map_err(|e| e.to_string()))
+            .await?
+        {
             Ok(result) => Ok(success_json(serde_json::json!({
-                "namespace": namespace,
+                "namespace": response_namespace,
                 "decayed": result.decayed,
                 "deleted": result.deleted
             }))),
@@ -336,10 +399,17 @@ impl ConchServer {
     #[tool(name = "stats", description = "Get memory statistics.")]
     async fn stats(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let namespace = self.namespace_or_default(p.namespace.as_deref());
-        match self.with_conch(|conch| conch.stats_in(namespace).map_err(|e| e.to_string()))? {
+        let namespace = self
+            .namespace_or_default(p.namespace.as_deref())
+            .to_string();
+        let response_namespace = namespace.clone();
+
+        match self
+            .with_conch_blocking(move |conch| conch.stats_in(&namespace).map_err(|e| e.to_string()))
+            .await?
+        {
             Ok(stats) => Ok(success_json(serde_json::json!({
-                "namespace": namespace,
+                "namespace": response_namespace,
                 "total_memories": stats.total_memories,
                 "total_facts": stats.total_facts,
                 "total_episodes": stats.total_episodes,
@@ -421,6 +491,24 @@ mod tests {
 
         assert_eq!(server.namespace_or_default(None), "team-a");
         assert_eq!(server.namespace_or_default(Some("team-b")), "team-b");
+    }
+
+    #[tokio::test]
+    async fn with_conch_blocking_returns_successful_result() {
+        let db = ConchDB::open_in_memory_with(Box::new(NoopEmbedder)).expect("db");
+        let server = ConchServer::new(db, "default-ns".to_string());
+
+        let result = server
+            .with_conch_blocking(|conch| {
+                conch
+                    .remember_episode_in("team-c", "implemented async helper")
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .expect("helper should return outer Ok");
+
+        let memory = result.expect("helper should return inner success");
+        assert_eq!(memory.namespace, "team-c");
     }
 
     fn tool_result_json_text(result: &CallToolResult) -> serde_json::Value {
