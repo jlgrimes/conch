@@ -164,9 +164,10 @@ effective_strength = base_strength × exp(-lambda(kind) × elapsed_days)
 
 Single SQLite file at `~/.conch/default.db`. Override with `--db <path>`.
 
-## Roadmap / Market Landscape
+## Documentation
 
-See [`docs/market-landscape-2026-02.md`](docs/market-landscape-2026-02.md) for a concise competitor landscape and prioritized Conch roadmap recommendations.
+- Testing guide: [`docs/testing.md`](docs/testing.md)
+- Roadmap / market landscape: [`docs/market-landscape-2026-02.md`](docs/market-landscape-2026-02.md)
 
 ## License
 
