@@ -56,11 +56,15 @@ fn parse_recall_kind(kind: Option<&str>) -> Result<RecallKindFilter, String> {
 fn lock_conch<'a>(
     conch: &'a Arc<Mutex<ConchDB>>,
 ) -> Result<std::sync::MutexGuard<'a, ConchDB>, CallToolResult> {
-    conch.lock().map_err(|_| {
-        CallToolResult::error(vec![Content::text(
-            "internal error: memory database lock poisoned".to_string(),
-        )])
-    })
+    match conch.lock() {
+        Ok(guard) => Ok(guard),
+        Err(_) => {
+            conch.clear_poison();
+            Err(CallToolResult::error(vec![Content::text(
+                "internal error: memory database lock poisoned".to_string(),
+            )]))
+        }
+    }
 }
 
 fn success_json(value: Value) -> CallToolResult {
@@ -68,9 +72,12 @@ fn success_json(value: Value) -> CallToolResult {
 }
 
 fn success_json_pretty<T: Serialize>(value: &T) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(
-        serde_json::to_string_pretty(value).expect("serialization should not fail"),
-    )])
+    match serde_json::to_string_pretty(value) {
+        Ok(serialized) => CallToolResult::success(vec![Content::text(serialized)]),
+        Err(err) => CallToolResult::error(vec![Content::text(format!(
+            "internal error: failed to serialize response ({err})"
+        ))]),
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -492,6 +499,12 @@ mod tests {
         assert!(
             result.is_err(),
             "poisoned lock should produce tool error, not panic"
+        );
+
+        let recovered = lock_conch(&lock);
+        assert!(
+            recovered.is_ok(),
+            "subsequent lock attempts should clear poison and succeed"
         );
     }
 
