@@ -139,7 +139,7 @@ conch-mcp
 ```
 
 Set `CONCH_DB` to customize the database path (default: `~/.conch/default.db`).
-The MCP server uses async `tokio` locks internally to avoid panic-on-poison behavior and reduce head-of-line blocking under concurrent tool calls.
+The MCP server handles lock acquisition failures as tool errors (instead of panicking), improving resilience under lock poisoning scenarios.
 
 ### Available tools
 

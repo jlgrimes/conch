@@ -8,8 +8,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RememberFactParams {
@@ -50,6 +49,16 @@ fn parse_recall_kind(kind: Option<&str>) -> Result<RecallKindFilter, String> {
             "invalid kind '{other}'. Expected one of: all, fact, episode"
         )),
     }
+}
+
+fn lock_conch<'a>(
+    conch: &'a Arc<Mutex<ConchDB>>,
+) -> Result<std::sync::MutexGuard<'a, ConchDB>, CallToolResult> {
+    conch.lock().map_err(|_| {
+        CallToolResult::error(vec![Content::text(
+            "internal error: memory database lock poisoned".to_string(),
+        )])
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -121,7 +130,7 @@ impl From<RecallResult> for MemoryResponse {
 
 #[derive(Clone)]
 struct ConchServer {
-    conch: Arc<RwLock<ConchDB>>,
+    conch: Arc<Mutex<ConchDB>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -129,7 +138,7 @@ struct ConchServer {
 impl ConchServer {
     fn new(conch: ConchDB) -> Self {
         Self {
-            conch: Arc::new(RwLock::new(conch)),
+            conch: Arc::new(Mutex::new(conch)),
             tool_router: Self::tool_router(),
         }
     }
@@ -144,7 +153,10 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.write().await;
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         match conch.remember_fact_in(namespace, &p.subject, &p.relation, &p.object) {
             Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
@@ -163,7 +175,10 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.write().await;
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         match conch.remember_episode_in(namespace, &p.text) {
             Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
@@ -183,7 +198,10 @@ impl ConchServer {
             Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg)])),
         };
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.read().await;
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         match conch.recall_filtered_in_with_options(
             namespace,
             &p.query,
@@ -213,7 +231,10 @@ impl ConchServer {
             )]));
         }
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.write().await;
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         let mut total = 0;
         if let Some(subject) = &p.subject {
             match conch.forget_by_subject_in(namespace, subject) {
@@ -242,7 +263,10 @@ impl ConchServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.write().await;
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         match conch.forget_by_id_in(namespace, &p.id) {
             Ok(n) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "forgotten": n }).to_string(),
@@ -258,7 +282,10 @@ impl ConchServer {
     async fn decay(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.write().await;
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         match conch.decay_in(namespace) {
             Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&result).unwrap(),
@@ -271,7 +298,10 @@ impl ConchServer {
     async fn stats(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let namespace = p.namespace.as_deref().unwrap_or("default");
-        let conch = self.conch.read().await;
+        let conch = match lock_conch(&self.conch) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         match conch.stats_in(namespace) {
             Ok(stats) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&stats).unwrap(),
@@ -305,25 +335,44 @@ impl ServerHandler for ConchServer {
 mod tests {
     use super::*;
 
+    struct NoopEmbedder;
+
+    impl conch_core::Embedder for NoopEmbedder {
+        fn embed(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<conch_core::embed::Embedding>, conch_core::EmbedError> {
+            Ok(texts.iter().map(|_| vec![0.0_f32, 0.0_f32]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
     #[test]
     fn parse_recall_kind_rejects_invalid_kind() {
         let err = parse_recall_kind(Some("bogus")).expect_err("invalid kind should error");
         assert!(err.contains("invalid kind"));
     }
 
-    #[tokio::test]
-    async fn rwlock_recovers_after_task_panic() {
-        let lock = Arc::new(RwLock::new(42_u32));
-        let lock_for_panic = Arc::clone(&lock);
+    #[test]
+    fn lock_conch_returns_error_when_poisoned() {
+        let db = ConchDB::open_in_memory_with(Box::new(NoopEmbedder)).expect("db");
+        let lock = Arc::new(Mutex::new(db));
 
-        let join = tokio::spawn(async move {
-            let _guard = lock_for_panic.write().await;
-            panic!("simulated panic while lock held");
-        });
-        assert!(join.await.is_err());
+        let lock_for_thread = Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let _guard = lock_for_thread.lock().expect("acquire lock");
+            panic!("poison lock for test");
+        })
+        .join();
 
-        let guard = lock.read().await;
-        assert_eq!(*guard, 42);
+        let result = lock_conch(&lock);
+        assert!(
+            result.is_err(),
+            "poisoned lock should produce tool error, not panic"
+        );
     }
 }
 
