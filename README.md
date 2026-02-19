@@ -95,21 +95,23 @@ Defaults:
 ## Commands
 
 ```
-conch remember <subject> <relation> <object>   # store a fact
-conch remember-episode <text>                   # store an event
-conch recall <query> [--limit N]               # semantic search
-conch recall <query> --kind all                # search facts + episodes (default)
-conch recall <query> --kind fact               # search only facts
-conch recall <query> --kind episode            # search only episodes
-conch forget --id <id>                          # delete by ID
-conch forget --subject <name>                   # delete by subject
-conch forget --older-than <duration>            # prune old (e.g. 30d)
-conch decay                                     # maintenance pass
-conch stats                                     # check health
-conch embed                                     # generate missing embeddings
-conch export                                    # JSON to stdout
-conch import                                    # JSON from stdin
+conch --namespace team-a remember <subject> <relation> <object>  # store a fact
+conch --namespace team-a remember-episode <text>                  # store an event
+conch --namespace team-a recall <query> [--limit N]               # semantic search
+conch recall <query> --kind all                                   # search facts + episodes (default)
+conch recall <query> --kind fact                                  # search only facts
+conch recall <query> --kind episode                               # search only episodes
+conch --namespace team-a forget --id <id>                         # delete by ID
+conch --namespace team-a forget --subject <name>                  # delete by subject
+conch --namespace team-a forget --older-than <duration>           # prune old (e.g. 30d)
+conch --namespace team-a decay                                    # maintenance pass
+conch --namespace team-a stats                                    # check health
+conch --namespace team-a embed                                    # generate missing embeddings
+conch export                                                      # JSON to stdout
+conch import                                                      # JSON from stdin
 ```
+
+`--namespace` defaults to `default`, so existing commands still work unchanged.
 
 ## MCP Server
 
@@ -132,6 +134,8 @@ Set `CONCH_DB` to customize the database path (default: `~/.conch/default.db`).
 | `forget_by_id` | Delete a specific memory by ID |
 | `decay` | Run temporal decay pass |
 | `stats` | Memory statistics |
+
+All relevant MCP tools accept an optional `namespace` field (default: `"default"`).
 
 ## Scoring
 

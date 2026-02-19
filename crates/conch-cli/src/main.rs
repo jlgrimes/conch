@@ -11,6 +11,8 @@ struct Cli {
     json: bool,
     #[arg(long, global = true)]
     quiet: bool,
+    #[arg(long, global = true, default_value = "default")]
+    namespace: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -120,7 +122,7 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             relation,
             object,
         } => {
-            let record = db.remember_fact(subject, relation, object)?;
+            let record = db.remember_fact_in(&cli.namespace, subject, relation, object)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&record)?);
             } else if !cli.quiet {
@@ -128,7 +130,7 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::RememberEpisode { text } => {
-            let record = db.remember_episode(text)?;
+            let record = db.remember_episode_in(&cli.namespace, text)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&record)?);
             } else if !cli.quiet {
@@ -136,7 +138,7 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Recall { query, limit, kind } => {
-            let results = db.recall_filtered(query, *limit, (*kind).into())?;
+            let results = db.recall_filtered_in(&cli.namespace, query, *limit, (*kind).into())?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else if !cli.quiet {
@@ -170,10 +172,10 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                 deleted += db.forget_by_id(mid)?;
             }
             if let Some(subj) = subject {
-                deleted += db.forget_by_subject(subj)?;
+                deleted += db.forget_by_subject_in(&cli.namespace, subj)?;
             }
             if let Some(dur) = older_than {
-                deleted += db.forget_older_than(parse_duration_secs(dur)?)?;
+                deleted += db.forget_older_than_in(&cli.namespace, parse_duration_secs(dur)?)?;
             }
             if cli.json {
                 println!("{}", serde_json::json!({ "deleted": deleted }));
@@ -182,7 +184,7 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Decay => {
-            let result = db.decay()?;
+            let result = db.decay_in(&cli.namespace)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else if !cli.quiet {
@@ -190,7 +192,7 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Stats => {
-            let stats = db.stats()?;
+            let stats = db.stats_in(&cli.namespace)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else if !cli.quiet {
@@ -202,7 +204,7 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Embed => {
-            let count = db.embed_all()?;
+            let count = db.embed_all_in(&cli.namespace)?;
             if cli.json {
                 println!("{}", serde_json::json!({ "embedded": count }));
             } else if !cli.quiet {

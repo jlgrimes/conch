@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RememberFactParams {
+    namespace: Option<String>,
     subject: String,
     relation: String,
     object: String,
@@ -19,11 +20,13 @@ struct RememberFactParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RememberEpisodeParams {
+    namespace: Option<String>,
     text: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RecallParams {
+    namespace: Option<String>,
     query: String,
     limit: Option<usize>,
     kind: Option<String>,
@@ -31,6 +34,7 @@ struct RecallParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ForgetParams {
+    namespace: Option<String>,
     subject: Option<String>,
     older_than_secs: Option<i64>,
 }
@@ -49,6 +53,11 @@ fn parse_recall_kind(kind: Option<&str>) -> Result<RecallKindFilter, String> {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ForgetByIdParams {
     id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NamespaceParams {
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,8 +118,9 @@ impl ConchServer {
         params: Parameters<RememberFactParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        let namespace = p.namespace.as_deref().unwrap_or("default");
         let conch = self.conch.lock().unwrap();
-        match conch.remember_fact(&p.subject, &p.relation, &p.object) {
+        match conch.remember_fact_in(namespace, &p.subject, &p.relation, &p.object) {
             Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
             )])),
@@ -127,8 +137,9 @@ impl ConchServer {
         params: Parameters<RememberEpisodeParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        let namespace = p.namespace.as_deref().unwrap_or("default");
         let conch = self.conch.lock().unwrap();
-        match conch.remember_episode(&p.text) {
+        match conch.remember_episode_in(namespace, &p.text) {
             Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({ "id": mem.id, "strength": mem.strength }).to_string(),
             )])),
@@ -146,8 +157,9 @@ impl ConchServer {
             Ok(kind) => kind,
             Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg)])),
         };
+        let namespace = p.namespace.as_deref().unwrap_or("default");
         let conch = self.conch.lock().unwrap();
-        match conch.recall_filtered(&p.query, p.limit.unwrap_or(5), kind) {
+        match conch.recall_filtered_in(namespace, &p.query, p.limit.unwrap_or(5), kind) {
             Ok(results) => {
                 let responses: Vec<MemoryResponse> =
                     results.into_iter().map(MemoryResponse::from).collect();
@@ -167,16 +179,17 @@ impl ConchServer {
                 "Provide 'subject' or 'older_than_secs'".to_string(),
             )]));
         }
+        let namespace = p.namespace.as_deref().unwrap_or("default");
         let conch = self.conch.lock().unwrap();
         let mut total = 0;
         if let Some(subject) = &p.subject {
-            match conch.forget_by_subject(subject) {
+            match conch.forget_by_subject_in(namespace, subject) {
                 Ok(n) => total += n,
                 Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
             }
         }
         if let Some(secs) = p.older_than_secs {
-            match conch.forget_older_than(secs) {
+            match conch.forget_older_than_in(namespace, secs) {
                 Ok(n) => total += n,
                 Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
             }
@@ -208,9 +221,11 @@ impl ConchServer {
         name = "decay",
         description = "Run decay pass. Memories lose strength over time; weak ones are pruned."
     )]
-    async fn decay(&self) -> Result<CallToolResult, McpError> {
+    async fn decay(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let namespace = p.namespace.as_deref().unwrap_or("default");
         let conch = self.conch.lock().unwrap();
-        match conch.decay() {
+        match conch.decay_in(namespace) {
             Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&result).unwrap(),
             )])),
@@ -219,9 +234,11 @@ impl ConchServer {
     }
 
     #[tool(name = "stats", description = "Get memory statistics.")]
-    async fn stats(&self) -> Result<CallToolResult, McpError> {
+    async fn stats(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let namespace = p.namespace.as_deref().unwrap_or("default");
         let conch = self.conch.lock().unwrap();
-        match conch.stats() {
+        match conch.stats_in(namespace) {
             Ok(stats) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&stats).unwrap(),
             )])),
