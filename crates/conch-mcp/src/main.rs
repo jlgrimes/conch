@@ -314,6 +314,14 @@ impl ConchServer {
                 "Provide 'subject' or 'older_than_secs'".to_string(),
             )]));
         }
+        if let Some(secs) = p.older_than_secs {
+            if secs < 0 {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "'older_than_secs' must be >= 0".to_string(),
+                )]));
+            }
+        }
+
         let namespace = self
             .namespace_or_default(p.namespace.as_deref())
             .to_string();
@@ -573,6 +581,45 @@ mod tests {
         let whitespace_json = tool_result_json_text(&whitespace);
         assert_eq!(blank_json["namespace"], "default-ns");
         assert_eq!(whitespace_json["namespace"], "default-ns");
+    }
+
+    #[tokio::test]
+    async fn forget_rejects_negative_older_than_secs_and_does_not_delete() {
+        let db = ConchDB::open_in_memory_with(Box::new(NoopEmbedder)).expect("db");
+        let server = ConchServer::new(db, "default-ns".to_string());
+
+        server
+            .remember_episode(Parameters(RememberEpisodeParams {
+                namespace: Some("team-b".to_string()),
+                text: "preserve this memory".to_string(),
+            }))
+            .await
+            .expect("seed memory should succeed");
+
+        let result = server
+            .forget(Parameters(ForgetParams {
+                namespace: Some("team-b".to_string()),
+                subject: None,
+                older_than_secs: Some(-1),
+            }))
+            .await
+            .expect("tool call should return mcp payload");
+
+        let outer = serde_json::to_value(&result).expect("serialize tool result");
+        assert_eq!(outer["isError"], serde_json::Value::Bool(true));
+        let error_text = outer["content"][0]["text"]
+            .as_str()
+            .expect("error text payload");
+        assert!(error_text.contains("'older_than_secs' must be >= 0"));
+
+        let stats = server
+            .stats(Parameters(NamespaceParams {
+                namespace: Some("team-b".to_string()),
+            }))
+            .await
+            .expect("stats should succeed");
+        let stats_json = tool_result_json_text(&stats);
+        assert_eq!(stats_json["total_memories"], 1);
     }
 
     #[tokio::test]

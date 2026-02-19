@@ -29,6 +29,8 @@ pub enum ConchError {
     Db(#[from] rusqlite::Error),
     #[error("embedding error: {0}")]
     Embed(#[from] EmbedError),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 impl ConchDB {
@@ -240,10 +242,20 @@ impl ConchDB {
     }
 
     pub fn forget_older_than(&self, secs: i64) -> Result<usize, ConchError> {
+        if secs < 0 {
+            return Err(ConchError::InvalidInput(
+                "older_than_secs must be >= 0".to_string(),
+            ));
+        }
         Ok(self.store.forget_older_than(Duration::seconds(secs))?)
     }
 
     pub fn forget_older_than_in(&self, namespace: &str, secs: i64) -> Result<usize, ConchError> {
+        if secs < 0 {
+            return Err(ConchError::InvalidInput(
+                "older_than_secs must be >= 0".to_string(),
+            ));
+        }
         Ok(self
             .store
             .forget_older_than_in(namespace, Duration::seconds(secs))?)
@@ -554,6 +566,36 @@ mod tests {
 
         assert!(db.store().get_memory(a.id).unwrap().is_some());
         assert!(db.store().get_memory(b.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn forget_older_than_rejects_negative_seconds_and_does_not_delete() {
+        let db = ConchDB::open_in_memory_with(Box::new(MockEmbedder)).unwrap();
+
+        db.remember_episode("keep me").unwrap();
+
+        let err = db
+            .forget_older_than(-1)
+            .expect_err("negative older_than_secs should be rejected");
+        assert!(err.to_string().contains("older_than_secs must be >= 0"));
+
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.total_memories, 1);
+    }
+
+    #[test]
+    fn forget_older_than_in_rejects_negative_seconds_and_does_not_delete() {
+        let db = ConchDB::open_in_memory_with(Box::new(MockEmbedder)).unwrap();
+
+        db.remember_episode_in("team-a", "keep me").unwrap();
+
+        let err = db
+            .forget_older_than_in("team-a", -5)
+            .expect_err("negative older_than_secs should be rejected");
+        assert!(err.to_string().contains("older_than_secs must be >= 0"));
+
+        let stats = db.stats_in("team-a").unwrap();
+        assert_eq!(stats.total_memories, 1);
     }
 
     #[test]
