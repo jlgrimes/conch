@@ -182,7 +182,7 @@ Single SQLite file at `~/.conch/default.db`. Override with `--db <path>`.
 
 ## Documentation
 
-- Testing guide: [`docs/testing.md`](docs/testing.md)
+- Testing guide: [`docs/testing.md`](docs/testing.md) (includes MCP concurrency regression coverage and `conch-mcp` test command)
 - Roadmap / market landscape: [`docs/market-landscape-2026-02.md`](docs/market-landscape-2026-02.md)
 
 ## License

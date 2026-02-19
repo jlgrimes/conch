@@ -24,6 +24,21 @@ cargo test -p conch-core
 
 # CLI command-level tests
 cargo test -p conch
+
+# MCP server tests
+cargo test -p conch-mcp
+```
+
+### MCP concurrency regression coverage
+
+The MCP crate includes a regression test that exercises concurrent read/write tool calls to prevent lock/runtime regressions in the async server:
+
+- `concurrent_mixed_remember_and_recall_regression`
+
+Run just MCP tests with:
+
+```bash
+cargo test -p conch-mcp
 ```
 
 ## Lint/format checks used in CI
