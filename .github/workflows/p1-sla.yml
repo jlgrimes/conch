@@ -1,0 +1,134 @@
+name: P1 SLA Enforcement
+
+on:
+  issues:
+    types: [labeled, opened]
+  schedule:
+    # Daily stale P1 check at 09:00 UTC
+    - cron: "0 9 * * *"
+
+permissions:
+  issues: write
+
+jobs:
+  # ─── Job 1: Stamp SLA deadline when P1 label is applied ───────────────────
+  stamp-sla:
+    if: >
+      github.event_name == 'issues' &&
+      (github.event.action == 'labeled' || github.event.action == 'opened') &&
+      contains(github.event.issue.labels.*.name, 'P1')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute SLA deadline
+        id: deadline
+        run: |
+          # 48h from now in ISO 8601
+          DEADLINE=$(date -u -d '+48 hours' '+%Y-%m-%dT%H:%M:%SZ')
+          echo "deadline=$DEADLINE" >> $GITHUB_OUTPUT
+
+      - name: Post SLA comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deadline = '${{ steps.deadline.outputs.deadline }}';
+            const deadlineDate = new Date(deadline);
+            const formatted = deadlineDate.toUTCString();
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ⚠️ P1 SLA Activated',
+                '',
+                `**48-hour deadline: ${formatted}**`,
+                '',
+                'This issue is classified P1. The following milestones apply:',
+                '',
+                '| Milestone | Target |',
+                '|-----------|--------|',
+                '| Root cause hypothesis | 4h from now |',
+                '| Workaround or draft fix | 24h from now |',
+                '| Fix merged + regression test | **48h from now** |',
+                '',
+                'See [P1 rubric](docs/reliability/p1-rubric.md) for full SLA definition.',
+                'If deadline is at risk, escalate to @jlgrimes immediately.',
+                '',
+                '**Required before close:**',
+                '- [ ] Affected component identified',
+                '- [ ] Reproduction steps documented',
+                '- [ ] Regression test added',
+                '- [ ] Fix merged',
+              ].join('\n'),
+            });
+
+  # ─── Job 2: Daily stale P1 check ──────────────────────────────────────────
+  stale-p1-check:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find stale P1 issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'P1',
+              state: 'open',
+              per_page: 50,
+            });
+
+            const now = Date.now();
+            const SLA_MS = 48 * 60 * 60 * 1000; // 48 hours in ms
+
+            for (const issue of issues) {
+              const createdAt = new Date(issue.created_at).getTime();
+              const ageMs = now - createdAt;
+              const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
+
+              if (ageMs > SLA_MS) {
+                // Check if there's a linked PR (look for "Fixes #N" in open PRs)
+                const { data: prs } = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                });
+
+                const linkedPR = prs.find(pr =>
+                  pr.body && pr.body.includes(`#${issue.number}`)
+                );
+
+                if (!linkedPR) {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    body: [
+                      `## 🚨 P1 SLA BREACHED — ${ageHours}h elapsed`,
+                      '',
+                      'This P1 issue has exceeded the 48-hour SLA with no linked PR.',
+                      '',
+                      '**Action required:** Escalate to @jlgrimes now.',
+                      '',
+                      'To suppress this alert, link a PR with `Fixes #' + issue.number + '` in the PR body.',
+                    ].join('\n'),
+                  });
+                }
+              } else if (ageMs > SLA_MS * 0.75) {
+                // 75% elapsed (36h) — early warning
+                const remaining = Math.floor((SLA_MS - ageMs) / (60 * 60 * 1000));
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: [
+                    `## ⏰ P1 SLA Warning — ${remaining}h remaining`,
+                    '',
+                    `This P1 issue has been open for ${ageHours}h. SLA deadline is approaching.`,
+                    '',
+                    'Ensure a fix is in progress or link a PR.',
+                  ].join('\n'),
+                });
+              }
+            }
