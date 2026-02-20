@@ -27,7 +27,18 @@ conch embed                                       # backfill embeddings
 
 - **Before answering** context questions → `conch recall`
 - **After learning** something → `conch remember` or `conch remember-episode`
-- **During heartbeats** → `conch decay` + `conch stats`
+- **During heartbeats** → memory consolidation pass (see below) + `conch decay`
+
+## Heartbeat Memory Consolidation
+
+Sessions frequently miss writes — facts get mentioned but never stored. Wire this into `HEARTBEAT.md` to catch the gaps automatically:
+
+1. **Recall** — `conch recall "recent context projects decisions preferences"` to see what's already there
+2. **Scan** — check recent cron logs for facts that weren't captured (project names, decisions, preferences, things built)
+3. **Write** — push missing facts via `conch remember` / `conch remember-episode`
+4. **Decay** — `conch decay`
+
+This turns conch from a tool you have to remember to use into infrastructure that runs itself. Targeted recall on demand keeps tokens low — nothing gets bulk-dumped into context.
 
 ## How Scoring Works
 
@@ -50,6 +61,7 @@ You are a system, not a person. You do not have discipline. These are determinis
 | A mistake is made | what went wrong + the lesson |
 | A lesson is learned | the lesson |
 | A person, place, or thing is introduced | the key facts |
+| A cron/agent is created or changed | what it does, schedule, why |
 
 **Rule:** Before finishing any reply where one of these conditions fired — call conch. Add 🐚 to confirm you stored it.
 
