@@ -2,6 +2,8 @@
 
 **Biological memory for AI agents.** Semantic search + decay, no API keys needed.
 
+[![Crates.io](https://img.shields.io/crates/v/conch.svg)](https://crates.io/crates/conch)
+[![docs.rs](https://docs.rs/conch-core/badge.svg)](https://docs.rs/conch-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/jlgrimes/conch/actions/workflows/ci.yml/badge.svg)](https://github.com/jlgrimes/conch/actions)
 
@@ -35,19 +37,11 @@ Conch after 6 months: 10,000 memories, 5 relevant ones returned per recall
 
 ## Install
 
-**Install from GitHub (recommended):**
 ```bash
-cargo install --git https://github.com/jlgrimes/conch conch
+cargo install conch
 ```
 
-**Build from source:**
-```bash
-git clone https://github.com/jlgrimes/conch
-cd conch
-cargo install --path crates/conch-cli
-```
-
-**No Cargo?** See the [Installation Guide](docs/install.md) for step-by-step instructions.
+**No Cargo?** See the [Installation Guide](docs/install.md) for prebuilt binaries and build-from-source instructions.
 
 ## Quick Start
 

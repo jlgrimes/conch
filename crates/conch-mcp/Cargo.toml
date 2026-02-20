@@ -8,7 +8,7 @@ repository = "https://github.com/jlgrimes/conch"
 homepage = "https://github.com/jlgrimes/conch"
 readme = "../../README.md"
 authors = ["Jared Grimes"]
-keywords = ["memory", "ai-agent", "mcp", "model-context-protocol"]
+keywords = ["memory", "ai-agent", "mcp", "agent-memory"]
 categories = ["database"]
 
 [[bin]]
