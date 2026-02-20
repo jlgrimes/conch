@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use conch_core::{ConchDB, memory::{MemoryKind, RememberResult}};
+use conch_core::{ConchDB, ValidationEngine, ValidationConfig, memory::{MemoryKind, RememberResult}};
 use std::io;
 
 #[derive(Parser)]
@@ -37,6 +37,9 @@ enum Command {
         /// Channel or context within the source
         #[arg(long)]
         channel: Option<String>,
+        /// Skip validation checks and store anyway (validation warnings are printed but not fatal)
+        #[arg(long)]
+        force: bool,
     },
     /// Store an episode (free-text event)
     RememberEpisode {
@@ -53,6 +56,9 @@ enum Command {
         /// Channel or context within the source
         #[arg(long)]
         channel: Option<String>,
+        /// Skip validation checks and store anyway (validation warnings are printed but not fatal)
+        #[arg(long)]
+        force: bool,
     },
     /// Semantic search for memories
     Recall {
@@ -125,6 +131,12 @@ enum Command {
     },
     /// Verify integrity of all memory checksums
     Verify,
+    /// Validate text content without storing it
+    Validate {
+        text: String,
+    },
+    /// Verify audit log tamper-evidence chain
+    VerifyAudit,
 }
 
 fn default_db_path() -> String {
@@ -174,9 +186,22 @@ fn main() {
 
 fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
-        Command::Remember { subject, relation, object, tags, source, session_id, channel } => {
+        Command::Remember { subject, relation, object, tags, source, session_id, channel, force } => {
             let tag_list = parse_tags(tags.as_deref());
             let src = Some(source.as_deref().unwrap_or("cli"));
+            // Validation: warn but don't block (--force skips validation entirely)
+            if !force {
+                let text = format!("{subject} {relation} {object}");
+                let val_cfg = ValidationConfig::default();
+                let val_result = ValidationEngine::validate(&text, &val_cfg);
+                if !val_result.passed && !cli.quiet {
+                    eprintln!("⚠ Validation warning: {} violation(s) detected:", val_result.violations.len());
+                    for v in &val_result.violations {
+                        eprintln!("  - {v:?}");
+                    }
+                    eprintln!("  (storing anyway; use --force to suppress this warning)");
+                }
+            }
             let result = db.remember_fact_dedup_full(subject, relation, object, &tag_list, src, session_id.as_deref(), channel.as_deref())?;
             if cli.json { println!("{}", serde_json::to_string_pretty(&result)?); }
             else if !cli.quiet {
@@ -192,9 +217,21 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Command::RememberEpisode { text, tags, source, session_id, channel } => {
+        Command::RememberEpisode { text, tags, source, session_id, channel, force } => {
             let tag_list = parse_tags(tags.as_deref());
             let src = Some(source.as_deref().unwrap_or("cli"));
+            // Validation: warn but don't block (--force skips validation entirely)
+            if !force {
+                let val_cfg = ValidationConfig::default();
+                let val_result = ValidationEngine::validate(text, &val_cfg);
+                if !val_result.passed && !cli.quiet {
+                    eprintln!("⚠ Validation warning: {} violation(s) detected:", val_result.violations.len());
+                    for v in &val_result.violations {
+                        eprintln!("  - {v:?}");
+                    }
+                    eprintln!("  (storing anyway; use --force to suppress this warning)");
+                }
+            }
             let result = db.remember_episode_dedup_full(text, &tag_list, src, session_id.as_deref(), channel.as_deref())?;
             if cli.json { println!("{}", serde_json::to_string_pretty(&result)?); }
             else if !cli.quiet {
@@ -407,6 +444,43 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                     println!("CORRUPTED: {} memories", result.corrupted.len());
                     for c in &result.corrupted {
                         println!("  id: {} expected: {} actual: {}", c.id, c.expected, c.actual);
+                    }
+                }
+            }
+        }
+        Command::Validate { text } => {
+            let config = ValidationConfig::default();
+            let result = ValidationEngine::validate(text, &config);
+            if cli.json {
+                let json = serde_json::json!({
+                    "passed": result.passed,
+                    "violations": result.violations.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>()
+                });
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            } else if !cli.quiet {
+                if result.passed {
+                    println!("✓ Validation passed — no issues detected.");
+                } else {
+                    println!("✗ Validation failed — {} violation(s):", result.violations.len());
+                    for v in &result.violations {
+                        println!("  - {v:?}");
+                    }
+                }
+            }
+        }
+        Command::VerifyAudit => {
+            let result = db.verify_audit()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if !cli.quiet {
+                println!("Audit log entries checked: {}", result.total);
+                println!("Valid: {}", result.valid);
+                if result.tampered.is_empty() {
+                    println!("✓ Audit log integrity verified — no tampering detected.");
+                } else {
+                    println!("✗ TAMPERED: {} entries have broken hash chains:", result.tampered.len());
+                    for t in &result.tampered {
+                        println!("  id: {} expected: {} actual: {}", t.id, t.expected, t.actual);
                     }
                 }
             }

@@ -5,14 +5,16 @@ pub mod decay;
 pub mod recall;
 pub mod consolidate;
 pub mod importance;
+pub mod validate;
 
-pub use memory::{Episode, ExportData, Fact, GraphNode, MemoryKind, MemoryRecord, MemoryStats, ProvenanceInfo, RememberResult, AuditEntry, VerifyResult, CorruptedMemory};
+pub use memory::{Episode, ExportData, Fact, GraphNode, MemoryKind, MemoryRecord, MemoryStats, ProvenanceInfo, RememberResult, AuditEntry, VerifyResult, CorruptedMemory, AuditIntegrityResult, TamperedAuditEntry};
 pub use store::MemoryStore;
 pub use embed::{Embedder, EmbedError, FastEmbedder, SharedEmbedder, cosine_similarity};
 pub use decay::{run_decay, DecayResult};
 pub use recall::{recall, recall_with_tag_filter, RecallResult, RecallError};
 pub use consolidate::{consolidate, find_clusters, ConsolidateResult, ConsolidateCluster};
 pub use importance::{compute_importance, score_all as score_importance, list_importance, ImportanceInfo};
+pub use validate::{ValidationConfig, ValidationEngine, ValidationResult, Violation};
 
 use chrono::Duration;
 
@@ -21,6 +23,7 @@ pub struct ConchDB {
     store: MemoryStore,
     embedder: Box<dyn Embedder>,
     namespace: String,
+    validation_config: Option<ValidationConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +34,8 @@ pub enum ConchError {
     Embed(#[from] EmbedError),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("validation failed: {violations}")]
+    ValidationError { violations: String },
 }
 
 impl ConchDB {
@@ -41,7 +46,7 @@ impl ConchDB {
     pub fn open_with_namespace(path: &str, namespace: &str) -> Result<Self, ConchError> {
         let store = MemoryStore::open(path)?;
         let embedder = embed::FastEmbedder::new()?;
-        Ok(Self { store, embedder: Box::new(embedder), namespace: namespace.to_string() })
+        Ok(Self { store, embedder: Box::new(embedder), namespace: namespace.to_string(), validation_config: None })
     }
 
     pub fn open_in_memory_with(embedder: Box<dyn Embedder>) -> Result<Self, ConchError> {
@@ -50,7 +55,32 @@ impl ConchDB {
 
     pub fn open_in_memory_with_namespace(embedder: Box<dyn Embedder>, namespace: &str) -> Result<Self, ConchError> {
         let store = MemoryStore::open_in_memory()?;
-        Ok(Self { store, embedder, namespace: namespace.to_string() })
+        Ok(Self { store, embedder, namespace: namespace.to_string(), validation_config: None })
+    }
+
+    /// Set the validation config. Pass `None` to disable validation.
+    pub fn set_validation_config(&mut self, config: Option<ValidationConfig>) {
+        self.validation_config = config;
+    }
+
+    /// Get a reference to the current validation config (if any).
+    pub fn validation_config(&self) -> Option<&ValidationConfig> {
+        self.validation_config.as_ref()
+    }
+
+    /// Validate text using the current config (if set).
+    /// Returns `Err(ConchError::ValidationError)` if validation fails.
+    fn run_validation(&self, text: &str) -> Result<(), ConchError> {
+        if let Some(config) = &self.validation_config {
+            let result = ValidationEngine::validate(text, config);
+            if !result.passed {
+                let violations: Vec<String> = result.violations.iter().map(|v| format!("{v:?}")).collect();
+                return Err(ConchError::ValidationError {
+                    violations: violations.join("; "),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn namespace(&self) -> &str {
@@ -164,6 +194,7 @@ impl ConchDB {
         source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
     ) -> Result<RememberResult, ConchError> {
         let text = format!("{subject} {relation} {object}");
+        self.run_validation(&text)?;
         let embedding = self.embedder.embed_one(&text)?;
 
         // Step 1: Upsert — check for existing fact with same subject+relation
@@ -205,6 +236,7 @@ impl ConchDB {
         &self, text: &str, tags: &[String],
         source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
     ) -> Result<RememberResult, ConchError> {
+        self.run_validation(text)?;
         let embedding = self.embedder.embed_one(text)?;
 
         if let Some((existing_id, similarity)) = self.find_duplicate(&embedding)? {
@@ -434,6 +466,13 @@ impl ConchDB {
 
     pub fn audit_log(&self, limit: usize, memory_id: Option<i64>, actor: Option<&str>) -> Result<Vec<AuditEntry>, ConchError> {
         Ok(self.store.get_audit_log(limit, memory_id, actor)?)
+    }
+
+    // ── Security: Audit Integrity ───────────────────────────
+
+    /// Verify the tamper-evident audit log chain.
+    pub fn verify_audit(&self) -> Result<AuditIntegrityResult, ConchError> {
+        Ok(self.store.verify_audit_integrity()?)
     }
 
     // ── Security: Verify ────────────────────────────────────

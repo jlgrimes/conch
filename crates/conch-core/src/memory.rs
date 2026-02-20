@@ -75,6 +75,25 @@ pub struct AuditEntry {
     pub memory_id: Option<i64>,
     pub actor: String,
     pub details_json: Option<String>,
+    /// SHA-256 hash chaining this entry to the previous one (tamper evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_hash: Option<String>,
+}
+
+// ── Audit integrity types ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TamperedAuditEntry {
+    pub id: i64,
+    pub expected: String,
+    pub actual: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditIntegrityResult {
+    pub total: usize,
+    pub valid: usize,
+    pub tampered: Vec<TamperedAuditEntry>,
 }
 
 // ── Verification types ──────────────────────────────────────

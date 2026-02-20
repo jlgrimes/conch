@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-use crate::memory::{AuditEntry, CorruptedMemory, Episode, Fact, MemoryKind, MemoryRecord, MemoryStats, VerifyResult};
+use crate::memory::{AuditEntry, AuditIntegrityResult, CorruptedMemory, Episode, Fact, MemoryKind, MemoryRecord, MemoryStats, TamperedAuditEntry, VerifyResult};
 
 pub struct MemoryStore {
     conn: Connection,
@@ -110,6 +110,15 @@ impl MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor);
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);"
         )?;
+        // Migration: add entry_hash column to audit_log if missing
+        let has_entry_hash: bool = self.conn
+            .prepare("SELECT entry_hash FROM audit_log LIMIT 0")
+            .is_ok();
+        if !has_entry_hash {
+            self.conn.execute_batch(
+                "ALTER TABLE audit_log ADD COLUMN entry_hash TEXT;"
+            )?;
+        }
         Ok(())
     }
 
@@ -569,12 +578,88 @@ impl MemoryStore {
 
     pub fn log_audit(&self, action: &str, memory_id: Option<i64>, actor: &str, details_json: Option<&str>) -> SqlResult<()> {
         let now = Utc::now().to_rfc3339();
+
+        // Fetch the previous entry's hash for chaining (or use "genesis" for first)
+        let prev_hash: String = self.conn.query_row(
+            "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        ).optional()?.flatten().unwrap_or_else(|| "genesis".to_string());
+
+        // Compute entry_hash = hex(sha256(prev_hash | timestamp | action | memory_id | actor | details))
+        let mid_str = memory_id.unwrap_or(0).to_string();
+        let details_str = details_json.unwrap_or("");
+        let chain_input = format!("{prev_hash}|{now}|{action}|{mid_str}|{actor}|{details_str}");
+        let entry_hash = compute_audit_hash(&chain_input);
+
         self.conn.execute(
-            "INSERT INTO audit_log (timestamp, action, memory_id, actor, details_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![now, action, memory_id, actor, details_json],
+            "INSERT INTO audit_log (timestamp, action, memory_id, actor, details_json, entry_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![now, action, memory_id, actor, details_json, entry_hash],
         )?;
         Ok(())
+    }
+
+    /// Verify the tamper-evident audit log chain by recomputing each entry's expected hash.
+    pub fn verify_audit_integrity(&self) -> SqlResult<AuditIntegrityResult> {
+        // Walk all entries in insertion order
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, action, memory_id, actor, details_json, entry_hash
+             FROM audit_log ORDER BY id ASC",
+        )?;
+        let rows: Vec<(i64, String, String, Option<i64>, String, Option<String>, Option<String>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        let mut total = 0usize;
+        let mut valid = 0usize;
+        let mut tampered = Vec::new();
+        let mut prev_hash = "genesis".to_string();
+
+        for (id, timestamp, action, memory_id, actor, details_json, stored_hash) in &rows {
+            total += 1;
+            let mid_str = memory_id.unwrap_or(0).to_string();
+            let details_str = details_json.as_deref().unwrap_or("");
+            let chain_input = format!("{prev_hash}|{timestamp}|{action}|{mid_str}|{actor}|{details_str}");
+            let expected_hash = compute_audit_hash(&chain_input);
+
+            match stored_hash {
+                Some(actual) if *actual == expected_hash => {
+                    valid += 1;
+                    prev_hash = actual.clone();
+                }
+                Some(actual) => {
+                    tampered.push(TamperedAuditEntry {
+                        id: *id,
+                        expected: expected_hash.clone(),
+                        actual: actual.clone(),
+                    });
+                    // Still advance prev_hash using the stored value so chain continues
+                    prev_hash = actual.clone();
+                }
+                None => {
+                    // Entry without hash — treat as tampered
+                    tampered.push(TamperedAuditEntry {
+                        id: *id,
+                        expected: expected_hash.clone(),
+                        actual: String::new(),
+                    });
+                    prev_hash = expected_hash;
+                }
+            }
+        }
+
+        Ok(AuditIntegrityResult { total, valid, tampered })
     }
 
     pub fn get_audit_log(&self, limit: usize, memory_id: Option<i64>, actor: Option<&str>) -> SqlResult<Vec<AuditEntry>> {
@@ -588,6 +673,7 @@ impl MemoryStore {
                 memory_id: row.get(3)?,
                 actor: row.get(4)?,
                 details_json: row.get(5)?,
+                entry_hash: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -652,6 +738,12 @@ impl MemoryStore {
 
 // ── Helpers ──────────────────────────────────────────────────
 
+fn compute_audit_hash(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn compute_checksum(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -684,7 +776,7 @@ fn build_audit_query(limit: usize, memory_id: Option<i64>, actor: Option<&str>) 
 
     param_values.push(limit.to_string());
     let sql = format!(
-        "SELECT id, timestamp, action, memory_id, actor, details_json FROM audit_log{} ORDER BY id DESC LIMIT ?{}",
+        "SELECT id, timestamp, action, memory_id, actor, details_json, entry_hash FROM audit_log{} ORDER BY id DESC LIMIT ?{}",
         where_clause, param_values.len()
     );
     (sql, param_values)
