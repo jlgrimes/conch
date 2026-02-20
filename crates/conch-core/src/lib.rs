@@ -49,6 +49,12 @@ impl ConchDB {
         Ok(Self { store, embedder: Box::new(embedder), namespace: namespace.to_string(), validation_config: None })
     }
 
+    /// Open a file-based ConchDB with a custom embedder (useful for tests and custom embedding backends).
+    pub fn open_path_with_embedder(path: &str, embedder: Box<dyn Embedder>, namespace: &str) -> Result<Self, ConchError> {
+        let store = MemoryStore::open(path)?;
+        Ok(Self { store, embedder, namespace: namespace.to_string(), validation_config: None })
+    }
+
     pub fn open_in_memory_with(embedder: Box<dyn Embedder>) -> Result<Self, ConchError> {
         Self::open_in_memory_with_namespace(embedder, "default")
     }
