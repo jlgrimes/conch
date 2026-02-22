@@ -2,12 +2,17 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::thread::sleep;
+use std::time::Duration as StdDuration;
 
 use crate::memory::{AuditEntry, AuditIntegrityResult, CorruptedMemory, Episode, Fact, MemoryKind, MemoryRecord, MemoryStats, TamperedAuditEntry, VerifyResult};
 
 pub struct MemoryStore {
     conn: Connection,
 }
+
+const WRITE_RETRY_ATTEMPTS: usize = 3;
+const WRITE_RETRY_BACKOFF_MS: u64 = 25;
 
 impl MemoryStore {
     pub fn conn(&self) -> &Connection {
@@ -30,7 +35,8 @@ impl MemoryStore {
 
     fn init_schema(&self) -> SqlResult<()> {
         self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS memories (
+            "PRAGMA busy_timeout = 5000;
+            CREATE TABLE IF NOT EXISTS memories (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind            TEXT NOT NULL CHECK(kind IN ('fact', 'episode')),
                 subject         TEXT,
@@ -122,6 +128,32 @@ impl MemoryStore {
         Ok(())
     }
 
+    fn is_retryable_write_error(err: &rusqlite::Error) -> bool {
+        match err {
+            rusqlite::Error::SqliteFailure(code, _) => {
+                matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            }
+            _ => false,
+        }
+    }
+
+    fn with_write_retry<T, F>(&self, mut f: F) -> SqlResult<T>
+    where
+        F: FnMut() -> SqlResult<T>,
+    {
+        let mut attempt = 0;
+        loop {
+            match f() {
+                Ok(v) => return Ok(v),
+                Err(e) if attempt + 1 < WRITE_RETRY_ATTEMPTS && Self::is_retryable_write_error(&e) => {
+                    attempt += 1;
+                    sleep(StdDuration::from_millis(WRITE_RETRY_BACKOFF_MS * attempt as u64));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     // ── Remember ─────────────────────────────────────────────
 
     pub fn remember_fact(&self, subject: &str, relation: &str, object: &str, embedding: Option<&[f32]>) -> SqlResult<i64> {
@@ -151,11 +183,13 @@ impl MemoryStore {
         let tags_str = tags.join(",");
         let content = format!("{subject} {relation} {object}");
         let checksum = compute_checksum(&content);
-        self.conn.execute(
-            "INSERT INTO memories (kind, subject, relation, object, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
-             VALUES ('fact', ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![subject, relation, object, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum],
-        )?;
+        self.with_write_retry(|| {
+            self.conn.execute(
+                "INSERT INTO memories (kind, subject, relation, object, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
+                 VALUES ('fact', ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![subject, relation, object, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum],
+            )
+        })?;
         let id = self.conn.last_insert_rowid();
         self.log_audit("remember", Some(id), "system", Some(&format!("{{\"kind\":\"fact\",\"subject\":{},\"relation\":{},\"object\":{},\"namespace\":{}}}", serde_json::json!(subject), serde_json::json!(relation), serde_json::json!(object), serde_json::json!(namespace))))?;
         Ok(id)
@@ -194,15 +228,17 @@ impl MemoryStore {
             let tags_str = tags.join(",");
             let content = format!("{subject} {relation} {object}");
             let checksum = compute_checksum(&content);
-            self.conn.execute(
-                "UPDATE memories SET object = ?1, embedding = COALESCE(?2, embedding), \
-                 last_accessed_at = ?3, access_count = access_count + 1, \
-                 tags = ?4, source = COALESCE(?5, source), \
-                 session_id = COALESCE(?6, session_id), channel = COALESCE(?7, channel), \
-                 checksum = ?8 \
-                 WHERE id = ?9",
-                params![object, emb_blob, now, tags_str, source, session_id, channel, checksum, id],
-            )?;
+            self.with_write_retry(|| {
+                self.conn.execute(
+                    "UPDATE memories SET object = ?1, embedding = COALESCE(?2, embedding), \
+                     last_accessed_at = ?3, access_count = access_count + 1, \
+                     tags = ?4, source = COALESCE(?5, source), \
+                     session_id = COALESCE(?6, session_id), channel = COALESCE(?7, channel), \
+                     checksum = ?8 \
+                     WHERE id = ?9",
+                    params![object, emb_blob, now, tags_str, source, session_id, channel, checksum, id],
+                )
+            })?;
             self.log_audit("update", Some(id), "system", Some(&format!("{{\"kind\":\"fact\",\"subject\":{},\"relation\":{},\"object\":{},\"namespace\":{}}}", serde_json::json!(subject), serde_json::json!(relation), serde_json::json!(object), serde_json::json!(namespace))))?;
             Ok((id, true))
         } else {
@@ -237,11 +273,13 @@ impl MemoryStore {
         let emb_blob = embedding.map(embedding_to_blob);
         let tags_str = tags.join(",");
         let checksum = compute_checksum(text);
-        self.conn.execute(
-            "INSERT INTO memories (kind, episode_text, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
-             VALUES ('episode', ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![text, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum],
-        )?;
+        self.with_write_retry(|| {
+            self.conn.execute(
+                "INSERT INTO memories (kind, episode_text, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
+                 VALUES ('episode', ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![text, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum],
+            )
+        })?;
         let id = self.conn.last_insert_rowid();
         self.log_audit("remember", Some(id), "system", Some(&format!("{{\"kind\":\"episode\",\"namespace\":{}}}", serde_json::json!(namespace))))?;
         Ok(id)
