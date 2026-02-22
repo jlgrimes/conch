@@ -67,6 +67,17 @@ pub struct WriteRetryStats {
     pub failed_events: usize,
     pub recovered_retries_total: usize,
     pub failed_retries_total: usize,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub per_operation: std::collections::BTreeMap<String, OperationWriteRetryStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OperationWriteRetryStats {
+    pub retrying_events: usize,
+    pub recovered_events: usize,
+    pub failed_events: usize,
+    pub recovered_retries_total: usize,
+    pub failed_retries_total: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

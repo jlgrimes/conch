@@ -5,7 +5,7 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration as StdDuration;
 
-use crate::memory::{AuditEntry, AuditIntegrityResult, CorruptedMemory, Episode, Fact, MemoryKind, MemoryRecord, MemoryStats, TamperedAuditEntry, VerifyResult, WriteRetryStats};
+use crate::memory::{AuditEntry, AuditIntegrityResult, CorruptedMemory, Episode, Fact, MemoryKind, MemoryRecord, MemoryStats, TamperedAuditEntry, VerifyResult, WriteRetryStats, OperationWriteRetryStats};
 
 pub struct MemoryStore {
     conn: Connection,
@@ -138,7 +138,7 @@ impl MemoryStore {
         }
     }
 
-    fn with_write_retry<T, F>(&self, mut f: F) -> SqlResult<T>
+    fn with_write_retry<T, F>(&self, operation: &str, mut f: F) -> SqlResult<T>
     where
         F: FnMut() -> SqlResult<T>,
     {
@@ -153,6 +153,7 @@ impl MemoryStore {
                             "system",
                             Some(&serde_json::json!({
                                 "status": "recovered",
+                                "operation": operation,
                                 "retries": attempt,
                             }).to_string()),
                         );
@@ -169,6 +170,7 @@ impl MemoryStore {
                         "system",
                         Some(&serde_json::json!({
                             "status": "retrying",
+                            "operation": operation,
                             "attempt": attempt,
                             "max_attempts": WRITE_RETRY_ATTEMPTS,
                             "backoff_ms": backoff,
@@ -185,6 +187,7 @@ impl MemoryStore {
                             "system",
                             Some(&serde_json::json!({
                                 "status": "failed",
+                                "operation": operation,
                                 "retries": attempt,
                                 "max_attempts": WRITE_RETRY_ATTEMPTS,
                                 "error": format!("{e}"),
@@ -226,7 +229,7 @@ impl MemoryStore {
         let tags_str = tags.join(",");
         let content = format!("{subject} {relation} {object}");
         let checksum = compute_checksum(&content);
-        self.with_write_retry(|| {
+        self.with_write_retry("remember_fact", || {
             self.conn.execute(
                 "INSERT INTO memories (kind, subject, relation, object, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
                  VALUES ('fact', ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -271,7 +274,7 @@ impl MemoryStore {
             let tags_str = tags.join(",");
             let content = format!("{subject} {relation} {object}");
             let checksum = compute_checksum(&content);
-            self.with_write_retry(|| {
+            self.with_write_retry("upsert_fact", || {
                 self.conn.execute(
                     "UPDATE memories SET object = ?1, embedding = COALESCE(?2, embedding), \
                      last_accessed_at = ?3, access_count = access_count + 1, \
@@ -316,7 +319,7 @@ impl MemoryStore {
         let emb_blob = embedding.map(embedding_to_blob);
         let tags_str = tags.join(",");
         let checksum = compute_checksum(text);
-        self.with_write_retry(|| {
+        self.with_write_retry("remember_episode", || {
             self.conn.execute(
                 "INSERT INTO memories (kind, episode_text, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
                  VALUES ('episode', ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -670,16 +673,30 @@ impl MemoryStore {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&details) else { continue };
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or_default();
             let retries = v.get("retries").and_then(|r| r.as_u64()).unwrap_or(0) as usize;
+            let operation = v
+                .get("operation")
+                .and_then(|o| o.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let op = out.per_operation.entry(operation).or_insert_with(OperationWriteRetryStats::default);
 
             match status {
-                "retrying" => out.retrying_events += 1,
+                "retrying" => {
+                    out.retrying_events += 1;
+                    op.retrying_events += 1;
+                }
                 "recovered" => {
                     out.recovered_events += 1;
                     out.recovered_retries_total += retries;
+                    op.recovered_events += 1;
+                    op.recovered_retries_total += retries;
                 }
                 "failed" => {
                     out.failed_events += 1;
                     out.failed_retries_total += retries;
+                    op.failed_events += 1;
+                    op.failed_retries_total += retries;
                 }
                 _ => {}
             }
@@ -1680,7 +1697,7 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         let attempts = std::cell::Cell::new(0usize);
 
-        let result = store.with_write_retry(|| {
+        let result = store.with_write_retry("test", || {
             let n = attempts.get() + 1;
             attempts.set(n);
             if n < 3 {
@@ -1721,7 +1738,7 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         let attempts = std::cell::Cell::new(0usize);
 
-        let result = store.with_write_retry(|| {
+        let result = store.with_write_retry("test", || {
             attempts.set(attempts.get() + 1);
             Err::<(), _>(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error {
@@ -1741,7 +1758,7 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         let attempts = std::cell::Cell::new(0usize);
 
-        let result = store.with_write_retry(|| {
+        let result = store.with_write_retry("test", || {
             attempts.set(attempts.get() + 1);
             Err::<(), _>(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error {
@@ -1777,13 +1794,13 @@ mod tests {
     fn write_retry_stats_aggregate_events() {
         let store = MemoryStore::open_in_memory().unwrap();
 
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"retrying\",\"attempt\":1}"))
+        store.log_audit("write_retry", None, "system", Some("{\"status\":\"retrying\",\"operation\":\"remember_fact\",\"attempt\":1}"))
             .unwrap();
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"retrying\",\"attempt\":2}"))
+        store.log_audit("write_retry", None, "system", Some("{\"status\":\"retrying\",\"operation\":\"remember_fact\",\"attempt\":2}"))
             .unwrap();
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"recovered\",\"retries\":2}"))
+        store.log_audit("write_retry", None, "system", Some("{\"status\":\"recovered\",\"operation\":\"remember_fact\",\"retries\":2}"))
             .unwrap();
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"failed\",\"retries\":3}"))
+        store.log_audit("write_retry", None, "system", Some("{\"status\":\"failed\",\"operation\":\"remember_episode\",\"retries\":3}"))
             .unwrap();
 
         let stats = store.write_retry_stats().unwrap();
@@ -1792,6 +1809,15 @@ mod tests {
         assert_eq!(stats.failed_events, 1);
         assert_eq!(stats.recovered_retries_total, 2);
         assert_eq!(stats.failed_retries_total, 3);
+
+        let fact = stats.per_operation.get("remember_fact").unwrap();
+        assert_eq!(fact.retrying_events, 2);
+        assert_eq!(fact.recovered_events, 1);
+        assert_eq!(fact.failed_events, 0);
+
+        let episode = stats.per_operation.get("remember_episode").unwrap();
+        assert_eq!(episode.failed_events, 1);
+        assert_eq!(episode.failed_retries_total, 3);
     }
 }
 

@@ -363,6 +363,20 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                     retry_stats.recovered_retries_total,
                     retry_stats.failed_retries_total,
                 );
+                if !retry_stats.per_operation.is_empty() {
+                    println!("Per-operation retry telemetry:");
+                    for (op, s) in &retry_stats.per_operation {
+                        println!(
+                            "  - {}: retrying={}, recovered={}, failed={}, recovered_retries_total={}, failed_retries_total={}",
+                            op,
+                            s.retrying_events,
+                            s.recovered_events,
+                            s.failed_events,
+                            s.recovered_retries_total,
+                            s.failed_retries_total,
+                        );
+                    }
+                }
             }
         }
         Command::Embed => {

@@ -8,7 +8,7 @@ pub mod importance;
 pub mod validate;
 pub mod isomorphic;
 
-pub use memory::{Episode, ExportData, Fact, GraphNode, MemoryKind, MemoryRecord, MemoryStats, ProvenanceInfo, RememberResult, AuditEntry, VerifyResult, CorruptedMemory, AuditIntegrityResult, TamperedAuditEntry, WriteRetryStats};
+pub use memory::{Episode, ExportData, Fact, GraphNode, MemoryKind, MemoryRecord, MemoryStats, ProvenanceInfo, RememberResult, AuditEntry, VerifyResult, CorruptedMemory, AuditIntegrityResult, TamperedAuditEntry, WriteRetryStats, OperationWriteRetryStats};
 pub use store::MemoryStore;
 pub use embed::{Embedder, EmbedError, FastEmbedder, SharedEmbedder, cosine_similarity};
 pub use decay::{run_decay, DecayResult};
