@@ -12,11 +12,25 @@ const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.3;
 /// RRF constant k — standard value used by Elasticsearch, Qdrant, etc.
 const RRF_K: f64 = 60.0;
 
+/// Explainability metadata for recall ranking.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecallScoreExplain {
+    pub rrf_score: f64,
+    pub decayed_strength: f64,
+    pub recency_boost: f64,
+    pub access_weight: f64,
+    pub base_score: f64,
+    pub spread_boost: f64,
+    pub temporal_boost: f64,
+    pub final_score: f64,
+}
+
 /// A recalled memory with its relevance score.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallResult {
     pub memory: MemoryRecord,
     pub score: f64,
+    pub explain: RecallScoreExplain,
 }
 
 /// Global decay constants (lambda/day) by memory kind.
@@ -133,9 +147,20 @@ pub fn recall_with_tag_filter_ns(
             let decayed_strength = effective_strength(mem, now);
             let recency = recency_boost(mem, now);
             let access = access_weight(mem, max_access);
+            let base_score = rrf_score * decayed_strength * recency * access;
             RecallResult {
                 memory: mem.clone(),
-                score: rrf_score * decayed_strength * recency * access,
+                score: base_score,
+                explain: RecallScoreExplain {
+                    rrf_score,
+                    decayed_strength,
+                    recency_boost: recency,
+                    access_weight: access,
+                    base_score,
+                    spread_boost: 0.0,
+                    temporal_boost: 0.0,
+                    final_score: base_score,
+                },
             }
         })
         .collect();
@@ -143,13 +168,22 @@ pub fn recall_with_tag_filter_ns(
     // ── Spreading activation ─────────────────────────────────
     // For each scored Fact, boost other results that share a subject or object.
     // This is 1-hop graph traversal inspired by Collins & Loftus (1975).
+    let before_spread: Vec<f64> = results.iter().map(|r| r.score).collect();
     spread_activation(&mut results, SPREAD_FACTOR);
+    for (i, r) in results.iter_mut().enumerate() {
+        r.explain.spread_boost = (r.score - before_spread[i]).max(0.0);
+    }
 
     // ── Temporal co-occurrence boost ─────────────────────────
     // Memories created near the same time as high-scoring results get a small
     // boost, implementing Tulving's encoding specificity / contextual
     // reinstatement principle.
+    let before_temporal: Vec<f64> = results.iter().map(|r| r.score).collect();
     temporal_cooccurrence_boost(&mut results);
+    for (i, r) in results.iter_mut().enumerate() {
+        r.explain.temporal_boost = (r.score - before_temporal[i]).max(0.0);
+        r.explain.final_score = r.score;
+    }
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
@@ -401,6 +435,19 @@ mod tests {
         }
     }
 
+    fn test_explain(score: f64) -> RecallScoreExplain {
+        RecallScoreExplain {
+            rrf_score: score,
+            decayed_strength: 1.0,
+            recency_boost: 1.0,
+            access_weight: 1.0,
+            base_score: score,
+            spread_boost: 0.0,
+            temporal_boost: 0.0,
+            final_score: score,
+        }
+    }
+
     #[test]
     fn effective_strength_decays_by_kind() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -548,14 +595,17 @@ mod tests {
             RecallResult {
                 memory: make_fact_record(1, "Jared", "has_pet", "Tortellini"),
                 score: 1.0,
+                explain: test_explain(1.0),
             },
             RecallResult {
                 memory: make_fact_record(2, "Tortellini", "is_a", "dog"),
                 score: 0.1, // low initial score
+                explain: test_explain(0.1),
             },
             RecallResult {
                 memory: make_fact_record(3, "Abby", "likes", "cats"),
                 score: 0.1, // unrelated
+                explain: test_explain(0.1),
             },
         ];
 
@@ -583,10 +633,12 @@ mod tests {
             RecallResult {
                 memory: make_fact_record(1, "Jared", "works_at", "Microsoft"),
                 score: 0.8,
+                explain: test_explain(0.8),
             },
             RecallResult {
                 memory: make_fact_record(2, "Microsoft", "located_in", "Seattle"),
                 score: 0.3,
+                explain: test_explain(0.3),
             },
         ];
 
@@ -607,6 +659,7 @@ mod tests {
             RecallResult {
                 memory: make_fact_record(1, "Jared", "builds", "Gen"),
                 score: 1.0,
+                explain: test_explain(1.0),
             },
         ];
 
@@ -625,14 +678,17 @@ mod tests {
             RecallResult {
                 memory: make_timed_episode(1, "alpha anchor memory", now),
                 score: 1.0,
+                explain: test_explain(1.0),
             },
             RecallResult {
                 memory: make_timed_episode(2, "alpha nearby memory", now - chrono::Duration::minutes(5)),
                 score: 0.2,
+                explain: test_explain(0.2),
             },
             RecallResult {
                 memory: make_timed_episode(3, "alpha distant memory", now - chrono::Duration::hours(3)),
                 score: 0.2,
+                explain: test_explain(0.2),
             },
         ];
 
@@ -661,14 +717,17 @@ mod tests {
             RecallResult {
                 memory: make_timed_episode(1, "alpha anchor", now),
                 score: 1.0,
+                explain: test_explain(1.0),
             },
             RecallResult {
                 memory: make_timed_episode(2, "alpha very close", now - chrono::Duration::minutes(2)),
                 score: 0.1,
+                explain: test_explain(0.1),
             },
             RecallResult {
                 memory: make_timed_episode(3, "alpha further", now - chrono::Duration::minutes(25)),
                 score: 0.1,
+                explain: test_explain(0.1),
             },
         ];
 
