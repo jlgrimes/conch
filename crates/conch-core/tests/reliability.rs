@@ -147,6 +147,62 @@ fn concurrent_writes() {
     cleanup_db(&tmp_path);
 }
 
+/// Under active lock contention, writes should eventually succeed and emit retry telemetry.
+#[test]
+fn write_retry_under_lock_contention_emits_telemetry() {
+    let tmp_path = temp_db_path("retry-contention");
+
+    // Initialize and enable WAL.
+    {
+        let store = MemoryStore::open(&tmp_path).unwrap();
+        store.conn().execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    }
+
+    // Thread 1: hold an IMMEDIATE transaction lock briefly.
+    let path_for_lock = tmp_path.clone();
+    let locker = std::thread::spawn(move || {
+        let lock_store = MemoryStore::open(&path_for_lock).unwrap();
+        lock_store.conn().execute_batch("BEGIN IMMEDIATE;").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        lock_store.conn().execute_batch("COMMIT;").unwrap();
+    });
+
+    // Give locker a head start to acquire lock.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // Thread 2 / main: aggressive timeout so SQLITE_BUSY bubbles and retry path is exercised.
+    let writer = MemoryStore::open(&tmp_path).unwrap();
+    writer.conn().execute_batch("PRAGMA busy_timeout=1;").unwrap();
+
+    let id = writer
+        .remember_fact("contention", "retry", "works", None)
+        .expect("write should recover after lock is released");
+    assert!(id > 0);
+
+    locker.join().unwrap();
+
+    let log = writer.get_audit_log(100, None, None).unwrap();
+    let retry_events: Vec<_> = log.iter().filter(|e| e.action == "write_retry").collect();
+    assert!(
+        !retry_events.is_empty(),
+        "expected write_retry audit events under contention"
+    );
+
+    let statuses: Vec<String> = retry_events
+        .iter()
+        .filter_map(|e| e.details_json.as_ref())
+        .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .filter_map(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    assert!(
+        statuses.iter().any(|s| s == "recovered") || statuses.iter().any(|s| s == "failed"),
+        "expected a terminal write_retry status (recovered/failed), got: {statuses:?}"
+    );
+
+    cleanup_db(&tmp_path);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Test 3: Decay isolation
 // ═════════════════════════════════════════════════════════════════════════════
