@@ -13,6 +13,7 @@ pub struct MemoryStore {
 
 const WRITE_RETRY_ATTEMPTS: usize = 3;
 const WRITE_RETRY_BACKOFF_MS: u64 = 25;
+const WRITE_RETRY_MAX_BACKOFF_MS: u64 = 250;
 
 impl MemoryStore {
     pub fn conn(&self) -> &Connection {
@@ -144,12 +145,54 @@ impl MemoryStore {
         let mut attempt = 0;
         loop {
             match f() {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    if attempt > 0 {
+                        let _ = self.log_audit(
+                            "write_retry",
+                            None,
+                            "system",
+                            Some(&serde_json::json!({
+                                "status": "recovered",
+                                "retries": attempt,
+                            }).to_string()),
+                        );
+                    }
+                    return Ok(v);
+                }
                 Err(e) if attempt + 1 < WRITE_RETRY_ATTEMPTS && Self::is_retryable_write_error(&e) => {
                     attempt += 1;
-                    sleep(StdDuration::from_millis(WRITE_RETRY_BACKOFF_MS * attempt as u64));
+                    let backoff = (WRITE_RETRY_BACKOFF_MS.saturating_mul(1u64 << (attempt - 1)))
+                        .min(WRITE_RETRY_MAX_BACKOFF_MS);
+                    let _ = self.log_audit(
+                        "write_retry",
+                        None,
+                        "system",
+                        Some(&serde_json::json!({
+                            "status": "retrying",
+                            "attempt": attempt,
+                            "max_attempts": WRITE_RETRY_ATTEMPTS,
+                            "backoff_ms": backoff,
+                            "error": format!("{e}"),
+                        }).to_string()),
+                    );
+                    sleep(StdDuration::from_millis(backoff));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if attempt > 0 || Self::is_retryable_write_error(&e) {
+                        let _ = self.log_audit(
+                            "write_retry",
+                            None,
+                            "system",
+                            Some(&serde_json::json!({
+                                "status": "failed",
+                                "retries": attempt,
+                                "max_attempts": WRITE_RETRY_ATTEMPTS,
+                                "error": format!("{e}"),
+                            }).to_string()),
+                        );
+                    }
+                    return Err(e);
+                }
             }
         }
     }
@@ -1622,6 +1665,23 @@ mod tests {
 
         assert_eq!(result.unwrap(), 42);
         assert_eq!(attempts.get(), 3, "should retry twice then succeed");
+
+        let write_retry_events: Vec<_> = store
+            .get_audit_log(20, None, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "write_retry")
+            .collect();
+        assert_eq!(write_retry_events.len(), 3, "two retry events + one recovered event");
+        let has_recovered = write_retry_events.iter().any(|e| {
+            e.details_json
+                .as_ref()
+                .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("recovered")
+        });
+        assert!(has_recovered, "expected at least one recovered write_retry event");
     }
 
     #[test]
@@ -1662,6 +1722,23 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.get(), WRITE_RETRY_ATTEMPTS);
+
+        let write_retry_events: Vec<_> = store
+            .get_audit_log(20, None, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "write_retry")
+            .collect();
+        assert_eq!(write_retry_events.len(), WRITE_RETRY_ATTEMPTS, "retries plus terminal failure event");
+        let has_failed = write_retry_events.iter().any(|e| {
+            e.details_json
+                .as_ref()
+                .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("failed")
+        });
+        assert!(has_failed, "expected terminal failed write_retry event");
     }
 }
 
