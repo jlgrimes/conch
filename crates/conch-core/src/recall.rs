@@ -48,6 +48,29 @@ const EPISODE_TOUCH_BOOST: f64 = 0.20;
 const CANDIDATE_MULTIPLIER: usize = 10;
 const MIN_CANDIDATES: usize = 50;
 
+/// Coefficients controlling influence of each base score component.
+///
+/// Final base score formula:
+/// rrf^rrf_exp * decayed_strength^decay_exp * recency_boost^recency_exp * access_weight^access_exp
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RecallScoreCoefficients {
+    pub rrf_exp: f64,
+    pub decay_exp: f64,
+    pub recency_exp: f64,
+    pub access_exp: f64,
+}
+
+impl Default for RecallScoreCoefficients {
+    fn default() -> Self {
+        Self {
+            rrf_exp: 1.0,
+            decay_exp: 1.0,
+            recency_exp: 1.0,
+            access_exp: 1.0,
+        }
+    }
+}
+
 /// Spreading activation: fraction of a memory's score given to graph neighbors.
 const SPREAD_FACTOR: f64 = 0.15;
 
@@ -123,6 +146,8 @@ pub fn recall_with_tag_filter_ns(
         .max()
         .unwrap_or(0);
 
+    let coeffs = RecallScoreCoefficients::default();
+
     // BM25
     let bm25_ranked = bm25_search(query, &all_memories);
 
@@ -147,7 +172,7 @@ pub fn recall_with_tag_filter_ns(
             let decayed_strength = effective_strength(mem, now);
             let recency = recency_boost(mem, now);
             let access = access_weight(mem, max_access);
-            let base_score = rrf_score * decayed_strength * recency * access;
+            let base_score = compute_base_score(rrf_score, decayed_strength, recency, access, coeffs);
             RecallResult {
                 memory: mem.clone(),
                 score: base_score,
@@ -266,6 +291,19 @@ fn spread_activation(results: &mut Vec<RecallResult>, factor: f64) {
             results[idx].score += boost;
         }
     }
+}
+
+fn compute_base_score(
+    rrf_score: f64,
+    decayed_strength: f64,
+    recency: f64,
+    access: f64,
+    coeffs: RecallScoreCoefficients,
+) -> f64 {
+    rrf_score.powf(coeffs.rrf_exp)
+        * decayed_strength.powf(coeffs.decay_exp)
+        * recency.powf(coeffs.recency_exp)
+        * access.powf(coeffs.access_exp)
 }
 
 fn sort_recall_results(results: &mut [RecallResult]) {
@@ -776,6 +814,29 @@ mod tests {
         sort_recall_results(&mut results);
         let ids: Vec<i64> = results.iter().map(|r| r.memory.id).collect();
         assert_eq!(ids, vec![3, 7, 10]);
+    }
+
+    #[test]
+    fn coefficient_tuning_changes_base_score_tradeoff() {
+        // Candidate A: strong recency/access, weaker semantic score
+        let a = (0.70_f64, 0.95_f64, 0.95_f64, 1.80_f64);
+        // Candidate B: stronger semantic/decay, weaker recency/access
+        let b = (0.92_f64, 0.95_f64, 0.55_f64, 1.05_f64);
+
+        let default = RecallScoreCoefficients::default();
+        let a_default = compute_base_score(a.0, a.1, a.2, a.3, default);
+        let b_default = compute_base_score(b.0, b.1, b.2, b.3, default);
+        assert!(a_default > b_default, "default coeffs should favor fresher/high-access memory");
+
+        let semantic_heavy = RecallScoreCoefficients {
+            rrf_exp: 2.0,
+            decay_exp: 1.0,
+            recency_exp: 0.4,
+            access_exp: 0.4,
+        };
+        let a_semantic = compute_base_score(a.0, a.1, a.2, a.3, semantic_heavy);
+        let b_semantic = compute_base_score(b.0, b.1, b.2, b.3, semantic_heavy);
+        assert!(b_semantic > a_semantic, "semantic-heavy coeffs should flip ranking preference");
     }
 
     // ── Integration: full pipeline test ──────────────────────

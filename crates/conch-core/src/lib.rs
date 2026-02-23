@@ -12,7 +12,7 @@ pub use memory::{Episode, ExportData, Fact, GraphNode, MemoryKind, MemoryRecord,
 pub use store::MemoryStore;
 pub use embed::{Embedder, EmbedError, FastEmbedder, SharedEmbedder, cosine_similarity};
 pub use decay::{run_decay, DecayResult};
-pub use recall::{recall, recall_with_tag_filter, RecallResult, RecallScoreExplain, RecallError};
+pub use recall::{recall, recall_with_tag_filter, RecallResult, RecallScoreExplain, RecallScoreCoefficients, RecallError};
 pub use consolidate::{consolidate, find_clusters, ConsolidateResult, ConsolidateCluster};
 pub use importance::{compute_importance, score_all as score_importance, list_importance, ImportanceInfo};
 pub use validate::{ValidationConfig, ValidationEngine, ValidationResult, Violation};
