@@ -1,0 +1,5 @@
+{
+  "baseline": {"score": null, "samples": 0},
+  "post_hardening": {"score": null, "samples": 0},
+  "rubric": ["correctness", "relevance", "confidence"]
+}

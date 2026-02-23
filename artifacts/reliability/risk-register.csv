@@ -1,0 +1,11 @@
+risk_id,stage,severity,impact,owner,mitigation,status
+R1,ingest,high,stale memories,,,
+R2,store,high,write failure,,,
+R3,recall,high,bad ranking,,,
+R4,decay,medium,stale retention,,,
+R5,recall,medium,drift regression,,,
+R6,store,medium,duplicate growth,,,
+R7,ingest,medium,bad normalization,,,
+R8,recall,high,missing explainability,,,
+R9,ops,high,no alerting,,,
+R10,release,high,no gate checklist,,,
