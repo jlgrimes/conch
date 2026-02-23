@@ -1,5 +1,5 @@
-import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
+import { createServiceRoleClient } from "@/lib/supabase-server";
 
 async function sendAlerts(payload: { name: string; email: string; teamSize: string; useCase: string }) {
   const { name, email, teamSize, useCase } = payload;
@@ -43,17 +43,13 @@ export async function POST(req: Request) {
     return NextResponse.redirect(new URL("/?error=1", req.url));
   }
 
-  const url = process.env.SUPABASE_URL;
-  const serviceRole = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url || !serviceRole) {
-    console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  let supabase;
+  try {
+    supabase = createServiceRoleClient();
+  } catch (error) {
+    console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY", error);
     return NextResponse.redirect(new URL("/?error=1", req.url));
   }
-
-  const supabase = createClient(url, serviceRole, {
-    auth: { persistSession: false },
-  });
 
   const { error } = await supabase.from("reliability_leads").insert({
     name,

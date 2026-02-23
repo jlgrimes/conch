@@ -45,6 +45,31 @@ body {
   padding: clamp(20px, 2vw, 30px);
 }
 
+.top-nav {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 14px 18px;
+}
+
+.top-nav a,
+.top-nav span {
+  font-weight: 700;
+  text-decoration: none;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 8px 14px;
+  background: #ffffff;
+}
+
+.top-nav .active-nav {
+  border-color: color-mix(in srgb, var(--accent) 70%, #ffffff 30%);
+  color: #0c4c49;
+  background: #e1f2ef;
+}
+
 .hero {
   position: relative;
   overflow: hidden;
@@ -101,6 +126,8 @@ h1 {
 
 .primary-btn,
 .secondary-btn {
+  display: inline-block;
+  text-decoration: none;
   border: none;
   border-radius: 999px;
   font-weight: 700;
@@ -200,6 +227,12 @@ textarea {
   transform: translateY(-1px);
 }
 
+.secondary-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+  transform: none;
+}
+
 .status-ok,
 .status-err {
   margin-top: 12px;
@@ -220,8 +253,83 @@ textarea {
   color: #8e2424;
 }
 
+.engagement-list {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.engagement-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.engagement-item h3 {
+  margin-bottom: 4px;
+}
+
+.engagement-item p {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.workspace-meta-row {
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.deliverable-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.deliverable-form {
+  display: grid;
+  gap: 10px;
+}
+
+.deliverable-head h3 {
+  font-size: 1.1rem;
+}
+
+.deliverable-key {
+  margin-top: 6px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.deliverable-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.deliverable-footer .status-ok,
+.deliverable-footer .status-err {
+  margin: 0;
+}
+
 @media (max-width: 900px) {
   .tier-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .engagement-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .deliverable-grid {
     grid-template-columns: 1fr;
   }
 }
