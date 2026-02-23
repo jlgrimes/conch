@@ -228,3 +228,9 @@ cargo install --path crates/conch-cli
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Web Apps
+
+- Internal dashboard: `dashboard/` (internal tooling)
+- Customer-facing app: `customer-app/` (external site for `app.conch.lol`)
+- Deployment and DNS guide: `docs/customer-app-deploy.md`
