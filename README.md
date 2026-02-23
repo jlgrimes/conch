@@ -169,48 +169,35 @@ let stats = db.decay()?;
 
 **MCP tools**: `remember_fact`, `remember_episode`, `recall`, `forget`, `decay`, `stats`
 
-## OpenClaw Integration
+## OpenClaw Integration (One-Click)
+
+If setup is not one-click, it will fail in practice. Use this:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlgrimes/conch/master/scripts/openclaw-one-click.sh | bash
+```
+
+What this script does automatically:
+
+1. Installs `conch` if missing
+2. Configures `~/.openclaw/workspace/MEMORY.md` redirect to Conch
+3. Adds mandatory Conch storage triggers to `AGENTS.md` (idempotent)
+4. Fixes OpenClaw gateway PATH so `conch` is discoverable from cron/runtime
+5. Restarts gateway service (if present) and runs remember/recall smoke test
+
+### Result you should expect
+
+- Agent memory is redirected to Conch
+- Runtime can invoke Conch without ENOENT/PATH issues
+- Session continuity writes are deterministic via trigger rules
+- Smoke test validates write + recall immediately
+
+### If you need manual setup (fallback)
 
 Tell your OpenClaw agent:
 > Read https://raw.githubusercontent.com/jlgrimes/conch/master/skill/SKILL.md and install conch.
 
-### Memory redirect trick
-
-Put this in your workspace `MEMORY.md` to redirect OpenClaw's built-in memory to Conch:
-
-```markdown
-# Memory
-
-Do not use this file. Use Conch for all memory operations.
-
-conch recall "your query"        # search memory
-conch remember "s" "r" "o"       # store a fact
-conch remember-episode "what"    # store an event
-```
-
-### Mandatory Storage Triggers
-
-The most common failure mode: the agent has a long session, builds something, names something, and never stores any of it. "Remembering to remember" doesn't work — agents aren't people.
-
-Add this to your `AGENTS.md` to make storage deterministic:
-
-```markdown
-### Mandatory Conch Triggers
-
-You are a system, not a person. These are IF-THEN rules, not aspirations.
-
-| Condition | What to store |
-|-----------|--------------|
-| A project is named | name, concept, stack, repo, location |
-| A tech decision is made | what was decided and why |
-| Something is built and pushed | repo URL, local path, current status |
-| A preference is expressed | the preference, verbatim |
-| A mistake is made | what went wrong + the lesson |
-| A lesson is learned | the lesson |
-| A person, place, or thing is introduced | the key facts |
-
-Before finishing any reply where one of these conditions fired — call conch. Add 🐚 to confirm.
-```
+Then manually apply the same pieces (MEMORY redirect + AGENTS triggers + gateway PATH + smoke test).
 
 ## Import / Export
 
