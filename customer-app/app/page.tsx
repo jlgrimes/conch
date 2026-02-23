@@ -1,5 +1,3 @@
-import Link from "next/link";
-
 type SearchParams = Promise<{ submitted?: string; error?: string }>;
 
 const pricingTiers = [
@@ -30,13 +28,6 @@ export default async function Home({ searchParams }: { searchParams: SearchParam
 
   return (
     <main className="page-shell">
-      <nav className="top-nav card">
-        <Link href="/" className="active-nav">
-          Home
-        </Link>
-        <Link href="/workspace">Workspace</Link>
-      </nav>
-
       <header className="hero card">
         <p className="eyebrow">Conch Reliability</p>
         <h1>Fix memory reliability before it burns your product in production.</h1>
@@ -47,9 +38,6 @@ export default async function Home({ searchParams }: { searchParams: SearchParam
           <a href="https://conch.lol/reliability" className="primary-btn">
             See engagement details
           </a>
-          <Link href="/workspace" className="secondary-btn">
-            Open internal workspace
-          </Link>
           <span className="cta-note">Request onboarding and we’ll respond with next steps fast.</span>
         </div>
       </header>
