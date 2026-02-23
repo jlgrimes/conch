@@ -1,58 +1,61 @@
+type SearchParams = Promise<{ submitted?: string; error?: string }>;
+
 const pricingTiers = [
   {
     name: "Starter",
-    placeholder: "For solo builders and prototypes.",
+    detail: "For solo builders and prototypes.",
   },
   {
     name: "Growth",
-    placeholder: "For product teams shipping production agents.",
+    detail: "For product teams shipping production memory.",
   },
   {
     name: "Enterprise",
-    placeholder: "For high-scale memory governance and support.",
+    detail: "For high-scale memory governance and support.",
   },
 ];
 
 const proofItems = [
-  "Proof placeholder: benchmark snapshots and latency stats",
-  "Proof placeholder: customer logos and technical case studies",
-  "Proof placeholder: trust artifacts (security and reliability docs)",
+  "Semantic recall with reinforcement + decay",
+  "Explainable recall exports and ranking diagnostics",
+  "Reliability tooling for production memory operations",
 ];
 
-export default function Home() {
+export default async function Home({ searchParams }: { searchParams: SearchParams }) {
+  const params = await searchParams;
+  const submitted = params?.submitted === "1";
+  const errored = params?.error === "1";
+
   return (
     <main className="page-shell">
       <header className="hero card">
-        <p className="eyebrow">Conch for External Users</p>
-        <h1>Memory that helps agents learn, not just remember.</h1>
+        <p className="eyebrow">Conch App</p>
+        <h1>Memory infrastructure for production AI agents.</h1>
         <p className="lead">
-          Conch gives AI workflows semantic recall with biologically inspired decay and reinforcement, so memory stays relevant as your
-          product scales.
+          Durable semantic memory with biologically inspired decay and reinforcement so agent context stays useful as your product scales.
         </p>
         <div className="cta-row">
-          <button type="button" className="primary-btn">
-            Get Started
-          </button>
-          <span className="cta-note">CTA placeholder: wire to signup or waitlist when onboarding flow is ready.</span>
+          <a href="https://conch.lol/reliability" className="primary-btn">
+            View reliability
+          </a>
+          <span className="cta-note">Use this portal to request onboarding.</span>
         </div>
       </header>
 
       <section className="card" aria-labelledby="pricing-title">
-        <h2 id="pricing-title">Pricing and Offer</h2>
-        <p className="section-note">Placeholder section for packaging, feature gates, and contract terms.</p>
+        <h2 id="pricing-title">Plans</h2>
         <div className="tier-grid">
           {pricingTiers.map((tier) => (
             <article className="tier" key={tier.name}>
               <h3>{tier.name}</h3>
-              <p>{tier.placeholder}</p>
+              <p>{tier.detail}</p>
             </article>
           ))}
         </div>
       </section>
 
       <section className="card" aria-labelledby="trust-title">
-        <h2 id="trust-title">Trust and Proof</h2>
-        <p className="section-note">Placeholder section for product credibility signals.</p>
+        <h2 id="trust-title">Why teams pick Conch</h2>
         <ul className="proof-list">
           {proofItems.map((item) => (
             <li key={item}>{item}</li>
@@ -61,16 +64,20 @@ export default function Home() {
       </section>
 
       <section className="card" aria-labelledby="contact-title">
-        <h2 id="contact-title">Contact and Onboarding Request</h2>
-        <p className="section-note">Form placeholder only. Submission handling can be wired once backend endpoints are chosen.</p>
-        <form className="contact-form">
+        <h2 id="contact-title">Request onboarding</h2>
+        <p className="section-note">This form writes directly to our Supabase lead queue.</p>
+
+        {submitted && <p className="status-ok">Thanks — we got your request and will reach out shortly.</p>}
+        {errored && <p className="status-err">Couldn’t submit right now. Please try again in a moment.</p>}
+
+        <form className="contact-form" method="post" action="/api/reliability-leads">
           <label>
             Name
-            <input type="text" name="name" placeholder="Jane Doe" />
+            <input type="text" name="name" placeholder="Jane Doe" required />
           </label>
           <label>
             Work Email
-            <input type="email" name="email" placeholder="jane@company.com" />
+            <input type="email" name="email" placeholder="jane@company.com" required />
           </label>
           <label>
             Team Size

@@ -200,6 +200,26 @@ textarea {
   transform: translateY(-1px);
 }
 
+.status-ok,
+.status-err {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 0.95rem;
+}
+
+.status-ok {
+  background: #e8f8f3;
+  border: 1px solid #bce7d8;
+  color: #0c4c49;
+}
+
+.status-err {
+  background: #fdecec;
+  border: 1px solid #f2c4c4;
+  color: #8e2424;
+}
+
 @media (max-width: 900px) {
   .tier-grid {
     grid-template-columns: 1fr;
