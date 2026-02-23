@@ -146,7 +146,7 @@ pub fn recall_with_tag_filter_ns(
         .max()
         .unwrap_or(0);
 
-    let coeffs = RecallScoreCoefficients::default();
+    let coeffs = recall_score_coefficients_from_env();
 
     // BM25
     let bm25_ranked = bm25_search(query, &all_memories);
@@ -290,6 +290,24 @@ fn spread_activation(results: &mut Vec<RecallResult>, factor: f64) {
         if idx < results.len() {
             results[idx].score += boost;
         }
+    }
+}
+
+fn parse_coeff_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(default)
+}
+
+fn recall_score_coefficients_from_env() -> RecallScoreCoefficients {
+    let d = RecallScoreCoefficients::default();
+    RecallScoreCoefficients {
+        rrf_exp: parse_coeff_env("CONCH_RECALL_RRF_EXP", d.rrf_exp),
+        decay_exp: parse_coeff_env("CONCH_RECALL_DECAY_EXP", d.decay_exp),
+        recency_exp: parse_coeff_env("CONCH_RECALL_RECENCY_EXP", d.recency_exp),
+        access_exp: parse_coeff_env("CONCH_RECALL_ACCESS_EXP", d.access_exp),
     }
 }
 
@@ -814,6 +832,29 @@ mod tests {
         sort_recall_results(&mut results);
         let ids: Vec<i64> = results.iter().map(|r| r.memory.id).collect();
         assert_eq!(ids, vec![3, 7, 10]);
+    }
+
+    #[test]
+    fn env_coefficients_override_defaults() {
+        unsafe {
+            std::env::set_var("CONCH_RECALL_RRF_EXP", "2.5");
+            std::env::set_var("CONCH_RECALL_DECAY_EXP", "1.2");
+            std::env::set_var("CONCH_RECALL_RECENCY_EXP", "0.8");
+            std::env::set_var("CONCH_RECALL_ACCESS_EXP", "1.1");
+        }
+
+        let c = recall_score_coefficients_from_env();
+        assert!((c.rrf_exp - 2.5).abs() < 1e-9);
+        assert!((c.decay_exp - 1.2).abs() < 1e-9);
+        assert!((c.recency_exp - 0.8).abs() < 1e-9);
+        assert!((c.access_exp - 1.1).abs() < 1e-9);
+
+        unsafe {
+            std::env::remove_var("CONCH_RECALL_RRF_EXP");
+            std::env::remove_var("CONCH_RECALL_DECAY_EXP");
+            std::env::remove_var("CONCH_RECALL_RECENCY_EXP");
+            std::env::remove_var("CONCH_RECALL_ACCESS_EXP");
+        }
     }
 
     #[test]
