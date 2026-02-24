@@ -42,6 +42,16 @@ struct RememberEpisodeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct RememberActionParams {
+    text: String,
+    tags: Option<String>,
+    source: Option<String>,
+    session_id: Option<String>,
+    channel: Option<String>,
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct RecallParams {
     query: String,
     limit: Option<usize>,
@@ -139,12 +149,17 @@ struct MemoryResponse {
 impl From<RecallResult> for MemoryResponse {
     fn from(r: RecallResult) -> Self {
         let (kind, content) = match &r.memory.kind {
-            MemoryKind::Fact(f) => ("fact".into(), format!("{} {} {}", f.subject, f.relation, f.object)),
+            MemoryKind::Fact(f) => (
+                "fact".into(),
+                format!("{} {} {}", f.subject, f.relation, f.object),
+            ),
             MemoryKind::Episode(e) => ("episode".into(), e.text.clone()),
+            MemoryKind::Action(a) => ("action".into(), a.text.clone()),
         };
         MemoryResponse {
             id: r.memory.id,
-            kind, content,
+            kind,
+            content,
             strength: r.memory.strength,
             score: r.score,
             created_at: r.memory.created_at.to_rfc3339(),
@@ -161,7 +176,11 @@ impl From<RecallResult> for MemoryResponse {
 
 fn parse_tags_mcp(tags: Option<&str>) -> Vec<String> {
     match tags {
-        Some(s) if !s.is_empty() => s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
+        Some(s) if !s.is_empty() => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
         _ => vec![],
     }
 }
@@ -182,11 +201,20 @@ impl ConchServer {
 #[tool_router]
 impl ConchServer {
     fn new(db_path: String) -> Self {
-        Self { db_path, tool_router: Self::tool_router() }
+        Self {
+            db_path,
+            tool_router: Self::tool_router(),
+        }
     }
 
-    #[tool(name = "remember_fact", description = "Store a fact as a subject-relation-object triple. Uses upsert: if a fact with the same subject+relation exists, its object is updated. Optionally tag with comma-separated categories. Supports namespace isolation.")]
-    async fn remember_fact(&self, params: Parameters<RememberFactParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "remember_fact",
+        description = "Store a fact as a subject-relation-object triple. Uses upsert: if a fact with the same subject+relation exists, its object is updated. Optionally tag with comma-separated categories. Supports namespace isolation."
+    )]
+    async fn remember_fact(
+        &self,
+        params: Parameters<RememberFactParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let tags = parse_tags_mcp(p.tags.as_deref());
         let source = Some(p.source.as_deref().unwrap_or("mcp"));
@@ -194,7 +222,15 @@ impl ConchServer {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         };
-        match conch.remember_fact_dedup_full(&p.subject, &p.relation, &p.object, &tags, source, p.session_id.as_deref(), p.channel.as_deref()) {
+        match conch.remember_fact_dedup_full(
+            &p.subject,
+            &p.relation,
+            &p.object,
+            &tags,
+            source,
+            p.session_id.as_deref(),
+            p.channel.as_deref(),
+        ) {
             Ok(result) => {
                 let mem = result.memory();
                 let action = match &result {
@@ -210,8 +246,14 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "remember_episode", description = "Store a free-text episode or event. Optionally tag with comma-separated categories and track source. Supports namespace isolation.")]
-    async fn remember_episode(&self, params: Parameters<RememberEpisodeParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "remember_episode",
+        description = "Store a free-text episode or event. Optionally tag with comma-separated categories and track source. Supports namespace isolation."
+    )]
+    async fn remember_episode(
+        &self,
+        params: Parameters<RememberEpisodeParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let tags = parse_tags_mcp(p.tags.as_deref());
         let source = Some(p.source.as_deref().unwrap_or("mcp"));
@@ -227,7 +269,33 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "recall", description = "Search memories using natural language. BM25 + vector search, ranked by relevance x strength x recency. Optionally filter by tag. Supports namespace isolation.")]
+    #[tool(
+        name = "remember_action",
+        description = "Store an executed action (free-text operational event such as files changed, deployments, or status updates). Supports namespace isolation."
+    )]
+    async fn remember_action(
+        &self,
+        params: Parameters<RememberActionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let tags = parse_tags_mcp(p.tags.as_deref());
+        let source = Some(p.source.as_deref().unwrap_or("mcp"));
+        let conch = match self.open_db(p.namespace.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        };
+        match conch.remember_action_full(&p.text, &tags, source, p.session_id.as_deref(), p.channel.as_deref()) {
+            Ok(mem) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({ "id": mem.id, "strength": mem.strength, "tags": mem.tags, "source": mem.source, "namespace": mem.namespace }).to_string(),
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
+    }
+
+    #[tool(
+        name = "recall",
+        description = "Search memories using natural language. BM25 + vector search, ranked by relevance x strength x recency. Optionally filter by tag. Supports namespace isolation."
+    )]
     async fn recall(&self, params: Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(p.namespace.as_deref()) {
@@ -236,7 +304,8 @@ impl ConchServer {
         };
         match conch.recall_with_tag(&p.query, p.limit.unwrap_or(5), p.tag.as_deref()) {
             Ok(results) => {
-                let responses: Vec<MemoryResponse> = results.into_iter().map(MemoryResponse::from).collect();
+                let responses: Vec<MemoryResponse> =
+                    results.into_iter().map(MemoryResponse::from).collect();
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&responses).unwrap(),
                 )]))
@@ -245,11 +314,16 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "forget", description = "Delete memories by subject or by age. Supports namespace isolation.")]
+    #[tool(
+        name = "forget",
+        description = "Delete memories by subject or by age. Supports namespace isolation."
+    )]
     async fn forget(&self, params: Parameters<ForgetParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         if p.subject.is_none() && p.older_than_secs.is_none() {
-            return Ok(CallToolResult::error(vec![Content::text("Provide 'subject' or 'older_than_secs'".to_string())]));
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Provide 'subject' or 'older_than_secs'".to_string(),
+            )]));
         }
         let conch = match self.open_db(p.namespace.as_deref()) {
             Ok(c) => c,
@@ -257,15 +331,26 @@ impl ConchServer {
         };
         let mut total = 0;
         if let Some(subject) = &p.subject {
-            match conch.forget_by_subject(subject) { Ok(n) => total += n, Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])) }
+            match conch.forget_by_subject(subject) {
+                Ok(n) => total += n,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            }
         }
         if let Some(secs) = p.older_than_secs {
-            match conch.forget_older_than(secs) { Ok(n) => total += n, Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])) }
+            match conch.forget_older_than(secs) {
+                Ok(n) => total += n,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            }
         }
-        Ok(CallToolResult::success(vec![Content::text(serde_json::json!({ "forgotten": total }).to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::json!({ "forgotten": total }).to_string(),
+        )]))
     }
 
-    #[tool(name = "decay", description = "Run decay pass. Memories lose strength over time; weak ones are pruned. Supports namespace isolation.")]
+    #[tool(
+        name = "decay",
+        description = "Run decay pass. Memories lose strength over time; weak ones are pruned. Supports namespace isolation."
+    )]
     async fn decay(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(p.namespace.as_deref()) {
@@ -273,12 +358,17 @@ impl ConchServer {
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         };
         match conch.decay() {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&result).unwrap())])),
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap(),
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
 
-    #[tool(name = "related", description = "Graph traversal: find facts connected to a subject entity via 1-hop and multi-hop relationships. Returns a graph of related memories with hop distance.")]
+    #[tool(
+        name = "related",
+        description = "Graph traversal: find facts connected to a subject entity via 1-hop and multi-hop relationships. Returns a graph of related memories with hop distance."
+    )]
     async fn related(&self, params: Parameters<RelatedParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let depth = p.depth.unwrap_or(2);
@@ -294,7 +384,10 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "why", description = "Provenance: show full audit context for a memory — when created, by whom, access count, strength, source, session, channel, and 1-hop related facts.")]
+    #[tool(
+        name = "why",
+        description = "Provenance: show full audit context for a memory — when created, by whom, access count, strength, source, session, channel, and 1-hop related facts."
+    )]
     async fn why(&self, params: Parameters<WhyParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(None) {
@@ -312,7 +405,10 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "stats", description = "Get memory statistics. Supports namespace isolation.")]
+    #[tool(
+        name = "stats",
+        description = "Get memory statistics. Supports namespace isolation."
+    )]
     async fn stats(&self, params: Parameters<NamespaceParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(p.namespace.as_deref()) {
@@ -320,13 +416,21 @@ impl ConchServer {
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         };
         match conch.stats() {
-            Ok(stats) => Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&stats).unwrap())])),
+            Ok(stats) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&stats).unwrap(),
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
 
-    #[tool(name = "consolidate", description = "Consolidate related memories (sleep-like memory consolidation). Finds clusters of similar memories, boosts the strongest, and archives duplicates.")]
-    async fn consolidate(&self, params: Parameters<ConsolidateParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "consolidate",
+        description = "Consolidate related memories (sleep-like memory consolidation). Finds clusters of similar memories, boosts the strongest, and archives duplicates."
+    )]
+    async fn consolidate(
+        &self,
+        params: Parameters<ConsolidateParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let dry_run = p.dry_run.unwrap_or(false);
         let conch = match self.open_db(None) {
@@ -350,8 +454,14 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "importance", description = "Show or recompute importance scores for all memories. Importance affects decay rate — high-importance memories decay slower.")]
-    async fn importance(&self, params: Parameters<ImportanceScoreParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "importance",
+        description = "Show or recompute importance scores for all memories. Importance affects decay rate — high-importance memories decay slower."
+    )]
+    async fn importance(
+        &self,
+        params: Parameters<ImportanceScoreParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(None) {
             Ok(c) => c,
@@ -374,8 +484,14 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "set_importance", description = "Set the importance score for a specific memory. Importance (0.0-1.0) affects decay rate — high-importance memories decay slower.")]
-    async fn set_importance(&self, params: Parameters<ImportanceSetParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "set_importance",
+        description = "Set the importance score for a specific memory. Importance (0.0-1.0) affects decay rate — high-importance memories decay slower."
+    )]
+    async fn set_importance(
+        &self,
+        params: Parameters<ImportanceSetParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(None) {
             Ok(c) => c,
@@ -389,20 +505,31 @@ impl ConchServer {
         }
     }
 
-    #[tool(name = "audit_log", description = "View audit trail entries. Shows recent actions (remember, forget, decay, reinforce) with timestamps, actors, and details.")]
-    async fn audit_log(&self, params: Parameters<AuditLogParams>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        name = "audit_log",
+        description = "View audit trail entries. Shows recent actions (remember, forget, decay, reinforce) with timestamps, actors, and details."
+    )]
+    async fn audit_log(
+        &self,
+        params: Parameters<AuditLogParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(None) {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         };
         match conch.audit_log(p.limit.unwrap_or(20), p.memory_id, p.actor.as_deref()) {
-            Ok(entries) => Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&entries).unwrap())])),
+            Ok(entries) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&entries).unwrap(),
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
 
-    #[tool(name = "verify", description = "Verify memory integrity by checking SHA-256 checksums. Reports valid, corrupted, and missing-checksum memories. Supports namespace isolation.")]
+    #[tool(
+        name = "verify",
+        description = "Verify memory integrity by checking SHA-256 checksums. Reports valid, corrupted, and missing-checksum memories. Supports namespace isolation."
+    )]
     async fn verify(&self, params: Parameters<VerifyParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let conch = match self.open_db(p.namespace.as_deref()) {
@@ -410,7 +537,9 @@ impl ConchServer {
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         };
         match conch.verify() {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&result).unwrap())])),
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap(),
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }

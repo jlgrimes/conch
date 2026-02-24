@@ -1,11 +1,16 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Local, Offset, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
-use crate::memory::{AuditEntry, AuditIntegrityResult, CorruptedMemory, Episode, Fact, MemoryKind, MemoryRecord, MemoryStats, TamperedAuditEntry, VerifyResult, WriteRetryStats, OperationWriteRetryStats};
+use crate::memory::{
+    AuditEntry, AuditIntegrityResult, CorruptedMemory, Episode, Fact, Action, MemoryKind, MemoryRecord,
+    MemoryStats, OperationWriteRetryStats, TamperedAuditEntry, TemporalMetadata, VerifyResult,
+    WriteRetryStats,
+};
+use crate::temporal::extract_temporal_metadata;
 
 pub struct MemoryStore {
     conn: Connection,
@@ -14,6 +19,7 @@ pub struct MemoryStore {
 const WRITE_RETRY_ATTEMPTS: usize = 3;
 const WRITE_RETRY_BACKOFF_MS: u64 = 25;
 const WRITE_RETRY_MAX_BACKOFF_MS: u64 = 250;
+const WRITE_RETRY_JITTER_PCT: f64 = 0.20;
 
 impl MemoryStore {
     pub fn conn(&self) -> &Connection {
@@ -39,7 +45,7 @@ impl MemoryStore {
             "PRAGMA busy_timeout = 5000;
             CREATE TABLE IF NOT EXISTS memories (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind            TEXT NOT NULL CHECK(kind IN ('fact', 'episode')),
+                kind            TEXT NOT NULL CHECK(kind IN ('fact', 'episode', 'action')),
                 subject         TEXT,
                 relation        TEXT,
                 object          TEXT,
@@ -54,54 +60,69 @@ impl MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);",
         )?;
         // Migration: add tags column if missing
-        let has_tags: bool = self.conn
+        let has_tags: bool = self
+            .conn
             .prepare("SELECT tags FROM memories LIMIT 0")
             .is_ok();
         if !has_tags {
-            self.conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '';"
-            )?;
+            self.conn
+                .execute_batch("ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
         }
         // Migration: add source tracking columns if missing
-        let has_source: bool = self.conn
+        let has_source: bool = self
+            .conn
             .prepare("SELECT source FROM memories LIMIT 0")
             .is_ok();
         if !has_source {
             self.conn.execute_batch(
                 "ALTER TABLE memories ADD COLUMN source TEXT;
                  ALTER TABLE memories ADD COLUMN session_id TEXT;
-                 ALTER TABLE memories ADD COLUMN channel TEXT;"
+                 ALTER TABLE memories ADD COLUMN channel TEXT;",
             )?;
         }
         // Migration: add importance column if missing
-        let has_importance: bool = self.conn
+        let has_importance: bool = self
+            .conn
             .prepare("SELECT importance FROM memories LIMIT 0")
             .is_ok();
         if !has_importance {
             self.conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;"
+                "ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;",
             )?;
         }
         // Migration: add namespace column if missing
-        let has_namespace: bool = self.conn
+        let has_namespace: bool = self
+            .conn
             .prepare("SELECT namespace FROM memories LIMIT 0")
             .is_ok();
         if !has_namespace {
             self.conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';"
+                "ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';",
             )?;
         }
         self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);"
+            "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
         )?;
         // Migration: add checksum column if missing
-        let has_checksum: bool = self.conn
+        let has_checksum: bool = self
+            .conn
             .prepare("SELECT checksum FROM memories LIMIT 0")
             .is_ok();
         if !has_checksum {
-            self.conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN checksum TEXT;"
-            )?;
+            self.conn
+                .execute_batch("ALTER TABLE memories ADD COLUMN checksum TEXT;")?;
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_namespace_checksum ON memories(namespace, checksum);",
+        )?;
+        // Migration: add temporal metadata column if missing
+        let has_temporal_json: bool = self
+            .conn
+            .prepare("SELECT temporal_json FROM memories LIMIT 0")
+            .is_ok();
+        if !has_temporal_json {
+            self.conn
+                .execute_batch("ALTER TABLE memories ADD COLUMN temporal_json TEXT;")?;
         }
         // Audit log table
         self.conn.execute_batch(
@@ -115,16 +136,16 @@ impl MemoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_audit_log_memory_id ON audit_log(memory_id);
             CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor);
-            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);"
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);",
         )?;
         // Migration: add entry_hash column to audit_log if missing
-        let has_entry_hash: bool = self.conn
+        let has_entry_hash: bool = self
+            .conn
             .prepare("SELECT entry_hash FROM audit_log LIMIT 0")
             .is_ok();
         if !has_entry_hash {
-            self.conn.execute_batch(
-                "ALTER TABLE audit_log ADD COLUMN entry_hash TEXT;"
-            )?;
+            self.conn
+                .execute_batch("ALTER TABLE audit_log ADD COLUMN entry_hash TEXT;")?;
         }
         Ok(())
     }
@@ -132,7 +153,10 @@ impl MemoryStore {
     fn is_retryable_write_error(err: &rusqlite::Error) -> bool {
         match err {
             rusqlite::Error::SqliteFailure(code, _) => {
-                matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
             }
             _ => false,
         }
@@ -143,6 +167,7 @@ impl MemoryStore {
         F: FnMut() -> SqlResult<T>,
     {
         let mut attempt = 0;
+        let started_at = Instant::now();
         loop {
             match f() {
                 Ok(v) => {
@@ -151,31 +176,42 @@ impl MemoryStore {
                             "write_retry",
                             None,
                             "system",
-                            Some(&serde_json::json!({
-                                "status": "recovered",
-                                "operation": operation,
-                                "retries": attempt,
-                            }).to_string()),
+                            Some(
+                                &serde_json::json!({
+                                    "status": "recovered",
+                                    "operation": operation,
+                                    "retries": attempt,
+                                    "elapsed_ms": started_at.elapsed().as_millis() as u64,
+                                })
+                                .to_string(),
+                            ),
                         );
                     }
                     return Ok(v);
                 }
-                Err(e) if attempt + 1 < WRITE_RETRY_ATTEMPTS && Self::is_retryable_write_error(&e) => {
+                Err(e)
+                    if attempt + 1 < WRITE_RETRY_ATTEMPTS && Self::is_retryable_write_error(&e) =>
+                {
                     attempt += 1;
-                    let backoff = (WRITE_RETRY_BACKOFF_MS.saturating_mul(1u64 << (attempt - 1)))
-                        .min(WRITE_RETRY_MAX_BACKOFF_MS);
+                    let base_backoff = (WRITE_RETRY_BACKOFF_MS
+                        .saturating_mul(1u64 << (attempt - 1)))
+                    .min(WRITE_RETRY_MAX_BACKOFF_MS);
+                    let backoff = apply_retry_jitter(base_backoff);
                     let _ = self.log_audit(
                         "write_retry",
                         None,
                         "system",
-                        Some(&serde_json::json!({
-                            "status": "retrying",
-                            "operation": operation,
-                            "attempt": attempt,
-                            "max_attempts": WRITE_RETRY_ATTEMPTS,
-                            "backoff_ms": backoff,
-                            "error": format!("{e}"),
-                        }).to_string()),
+                        Some(
+                            &serde_json::json!({
+                                "status": "retrying",
+                                "operation": operation,
+                                "attempt": attempt,
+                                "max_attempts": WRITE_RETRY_ATTEMPTS,
+                                "backoff_ms": backoff,
+                                "error": format!("{e}"),
+                            })
+                            .to_string(),
+                        ),
                     );
                     sleep(StdDuration::from_millis(backoff));
                 }
@@ -185,13 +221,17 @@ impl MemoryStore {
                             "write_retry",
                             None,
                             "system",
-                            Some(&serde_json::json!({
-                                "status": "failed",
-                                "operation": operation,
-                                "retries": attempt,
-                                "max_attempts": WRITE_RETRY_ATTEMPTS,
-                                "error": format!("{e}"),
-                            }).to_string()),
+                            Some(
+                                &serde_json::json!({
+                                    "status": "failed",
+                                    "operation": operation,
+                                    "retries": attempt,
+                                    "max_attempts": WRITE_RETRY_ATTEMPTS,
+                                    "elapsed_ms": started_at.elapsed().as_millis() as u64,
+                                    "error": format!("{e}"),
+                                })
+                                .to_string(),
+                            ),
                         );
                     }
                     return Err(e);
@@ -202,26 +242,55 @@ impl MemoryStore {
 
     // ── Remember ─────────────────────────────────────────────
 
-    pub fn remember_fact(&self, subject: &str, relation: &str, object: &str, embedding: Option<&[f32]>) -> SqlResult<i64> {
+    pub fn remember_fact(
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        embedding: Option<&[f32]>,
+    ) -> SqlResult<i64> {
         self.remember_fact_with_tags(subject, relation, object, embedding, &[])
     }
 
-    pub fn remember_fact_with_tags(&self, subject: &str, relation: &str, object: &str, embedding: Option<&[f32]>, tags: &[String]) -> SqlResult<i64> {
+    pub fn remember_fact_with_tags(
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+    ) -> SqlResult<i64> {
         self.remember_fact_full(subject, relation, object, embedding, tags, None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn remember_fact_full(
-        &self, subject: &str, relation: &str, object: &str, embedding: Option<&[f32]>,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
     ) -> SqlResult<i64> {
-        self.remember_fact_ns(subject, relation, object, embedding, tags, source, session_id, channel, "default")
+        self.remember_fact_ns(
+            subject, relation, object, embedding, tags, source, session_id, channel, "default",
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn remember_fact_ns(
-        &self, subject: &str, relation: &str, object: &str, embedding: Option<&[f32]>,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
         namespace: &str,
     ) -> SqlResult<i64> {
         let now = Utc::now().to_rfc3339();
@@ -229,11 +298,36 @@ impl MemoryStore {
         let tags_str = tags.join(",");
         let content = format!("{subject} {relation} {object}");
         let checksum = compute_checksum(&content);
+
+        // Optional idempotency hardening for replay-heavy producers.
+        if idempotent_writes_enabled() {
+            if let Some(existing) = self.find_fact_by_checksum_ns(&checksum, namespace)? {
+                self.reinforce_memory(existing.id, 0.05)?;
+                self.log_audit(
+                    "remember_dedup",
+                    Some(existing.id),
+                    "system",
+                    Some(
+                        &serde_json::json!({
+                            "kind": "fact",
+                            "reason": "checksum_replay",
+                            "namespace": namespace,
+                            "checksum": checksum,
+                        })
+                        .to_string(),
+                    ),
+                )?;
+                return Ok(existing.id);
+            }
+        }
+
+        let temporal_json = extract_temporal_metadata(&content, temporal_anchor_time())
+            .and_then(|m| serde_json::to_string(&m).ok());
         self.with_write_retry("remember_fact", || {
             self.conn.execute(
-                "INSERT INTO memories (kind, subject, relation, object, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
-                 VALUES ('fact', ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![subject, relation, object, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum],
+                "INSERT INTO memories (kind, subject, relation, object, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum, temporal_json)
+                 VALUES ('fact', ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![subject, relation, object, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum, temporal_json],
             )
         })?;
         let id = self.conn.last_insert_rowid();
@@ -248,16 +342,32 @@ impl MemoryStore {
     /// Returns `(id, was_updated)`.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_fact(
-        &self, subject: &str, relation: &str, object: &str, embedding: Option<&[f32]>,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
     ) -> SqlResult<(i64, bool)> {
-        self.upsert_fact_ns(subject, relation, object, embedding, tags, source, session_id, channel, "default")
+        self.upsert_fact_ns(
+            subject, relation, object, embedding, tags, source, session_id, channel, "default",
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_fact_ns(
-        &self, subject: &str, relation: &str, object: &str, embedding: Option<&[f32]>,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
         namespace: &str,
     ) -> SqlResult<(i64, bool)> {
         // Check for existing fact with same subject+relation in the same namespace
@@ -274,21 +384,27 @@ impl MemoryStore {
             let tags_str = tags.join(",");
             let content = format!("{subject} {relation} {object}");
             let checksum = compute_checksum(&content);
+            let temporal_json = extract_temporal_metadata(&content, temporal_anchor_time())
+                .and_then(|m| serde_json::to_string(&m).ok());
             self.with_write_retry("upsert_fact", || {
                 self.conn.execute(
                     "UPDATE memories SET object = ?1, embedding = COALESCE(?2, embedding), \
                      last_accessed_at = ?3, access_count = access_count + 1, \
                      tags = ?4, source = COALESCE(?5, source), \
                      session_id = COALESCE(?6, session_id), channel = COALESCE(?7, channel), \
-                     checksum = ?8 \
-                     WHERE id = ?9",
-                    params![object, emb_blob, now, tags_str, source, session_id, channel, checksum, id],
+                     checksum = ?8, temporal_json = ?9 \
+                     WHERE id = ?10",
+                    params![
+                        object, emb_blob, now, tags_str, source, session_id, channel, checksum, temporal_json, id
+                    ],
                 )
             })?;
             self.log_audit("update", Some(id), "system", Some(&format!("{{\"kind\":\"fact\",\"subject\":{},\"relation\":{},\"object\":{},\"namespace\":{}}}", serde_json::json!(subject), serde_json::json!(relation), serde_json::json!(object), serde_json::json!(namespace))))?;
             Ok((id, true))
         } else {
-            let id = self.remember_fact_ns(subject, relation, object, embedding, tags, source, session_id, channel, namespace)?;
+            let id = self.remember_fact_ns(
+                subject, relation, object, embedding, tags, source, session_id, channel, namespace,
+            )?;
             Ok((id, false))
         }
     }
@@ -297,37 +413,148 @@ impl MemoryStore {
         self.remember_episode_with_tags(text, embedding, &[])
     }
 
-    pub fn remember_episode_with_tags(&self, text: &str, embedding: Option<&[f32]>, tags: &[String]) -> SqlResult<i64> {
+    pub fn remember_episode_with_tags(
+        &self,
+        text: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+    ) -> SqlResult<i64> {
         self.remember_episode_full(text, embedding, tags, None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn remember_episode_full(
-        &self, text: &str, embedding: Option<&[f32]>,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        text: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
     ) -> SqlResult<i64> {
-        self.remember_episode_ns(text, embedding, tags, source, session_id, channel, "default")
+        self.remember_episode_ns(
+            text, embedding, tags, source, session_id, channel, "default",
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn remember_episode_ns(
-        &self, text: &str, embedding: Option<&[f32]>,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        text: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
         namespace: &str,
     ) -> SqlResult<i64> {
         let now = Utc::now().to_rfc3339();
         let emb_blob = embedding.map(embedding_to_blob);
         let tags_str = tags.join(",");
         let checksum = compute_checksum(text);
+
+        if idempotent_writes_enabled() {
+            if let Some(existing) = self.find_memory_by_checksum_ns(&checksum, namespace)? {
+                self.reinforce_memory(existing.id, 0.05)?;
+                self.log_audit(
+                    "remember_dedup",
+                    Some(existing.id),
+                    "system",
+                    Some(
+                        &serde_json::json!({
+                            "kind": "episode",
+                            "reason": "checksum_replay",
+                            "namespace": namespace,
+                            "checksum": checksum,
+                        })
+                        .to_string(),
+                    ),
+                )?;
+                return Ok(existing.id);
+            }
+        }
+
+        let temporal_json = extract_temporal_metadata(text, temporal_anchor_time())
+            .and_then(|m| serde_json::to_string(&m).ok());
         self.with_write_retry("remember_episode", || {
             self.conn.execute(
-                "INSERT INTO memories (kind, episode_text, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum)
-                 VALUES ('episode', ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![text, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum],
+                "INSERT INTO memories (kind, episode_text, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum, temporal_json)
+                 VALUES ('episode', ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![text, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum, temporal_json],
             )
         })?;
         let id = self.conn.last_insert_rowid();
-        self.log_audit("remember", Some(id), "system", Some(&format!("{{\"kind\":\"episode\",\"namespace\":{}}}", serde_json::json!(namespace))))?;
+        self.log_audit(
+            "remember",
+            Some(id),
+            "system",
+            Some(&format!(
+                "{{\"kind\":\"episode\",\"namespace\":{}}}",
+                serde_json::json!(namespace)
+            )),
+        )?;
+        Ok(id)
+    }
+
+    pub fn remember_action(&self, text: &str, embedding: Option<&[f32]>) -> SqlResult<i64> {
+        self.remember_action_with_tags(text, embedding, &[])
+    }
+
+    pub fn remember_action_with_tags(
+        &self,
+        text: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+    ) -> SqlResult<i64> {
+        self.remember_action_full(text, embedding, tags, None, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn remember_action_full(
+        &self,
+        text: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
+    ) -> SqlResult<i64> {
+        self.remember_action_ns(text, embedding, tags, source, session_id, channel, "default")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn remember_action_ns(
+        &self,
+        text: &str,
+        embedding: Option<&[f32]>,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
+        namespace: &str,
+    ) -> SqlResult<i64> {
+        let now = Utc::now().to_rfc3339();
+        let emb_blob = embedding.map(embedding_to_blob);
+        let tags_str = tags.join(",");
+        let checksum = compute_checksum(text);
+
+        self.with_write_retry("remember_action", || {
+            self.conn.execute(
+                "INSERT INTO memories (kind, episode_text, embedding, created_at, last_accessed_at, tags, source, session_id, channel, namespace, checksum, temporal_json)
+                 VALUES ('action', ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![text, emb_blob, now, tags_str, source, session_id, channel, namespace, checksum, Option::<String>::None],
+            )
+        })?;
+        let id = self.conn.last_insert_rowid();
+        self.log_audit(
+            "remember",
+            Some(id),
+            "system",
+            Some(&format!(
+                "{{\"kind\":\"action\",\"namespace\":{}}}",
+                serde_json::json!(namespace)
+            )),
+        )?;
         Ok(id)
     }
 
@@ -337,11 +564,14 @@ impl MemoryStore {
         self.all_memories_with_text_ns("default")
     }
 
-    pub fn all_memories_with_text_ns(&self, namespace: &str) -> SqlResult<Vec<(MemoryRecord, String)>> {
+    pub fn all_memories_with_text_ns(
+        &self,
+        namespace: &str,
+    ) -> SqlResult<Vec<(MemoryRecord, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, subject, relation, object, episode_text,
                     strength, embedding, created_at, last_accessed_at, access_count,
-                    tags, source, session_id, channel, importance, namespace, checksum
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
              FROM memories WHERE strength > 0.01 AND namespace = ?1",
         )?;
         let rows = stmt.query_map(params![namespace], |row| {
@@ -352,16 +582,60 @@ impl MemoryStore {
         rows.collect()
     }
 
-    pub fn all_memories_with_text_filtered_by_tag(&self, tag: &str) -> SqlResult<Vec<(MemoryRecord, String)>> {
+    pub fn find_memory_by_checksum_ns(
+        &self,
+        checksum: &str,
+        namespace: &str,
+    ) -> SqlResult<Option<MemoryRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, kind, subject, relation, object, episode_text,
+                    strength, embedding, created_at, last_accessed_at, access_count,
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
+             FROM memories WHERE checksum = ?1 AND namespace = ?2
+             ORDER BY id ASC LIMIT 1",
+                params![checksum, namespace],
+                row_to_memory,
+            )
+            .optional()
+    }
+
+    pub fn find_fact_by_checksum_ns(
+        &self,
+        checksum: &str,
+        namespace: &str,
+    ) -> SqlResult<Option<MemoryRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, kind, subject, relation, object, episode_text,
+                    strength, embedding, created_at, last_accessed_at, access_count,
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
+             FROM memories
+             WHERE checksum = ?1 AND namespace = ?2 AND kind = 'fact'
+             ORDER BY id ASC LIMIT 1",
+                params![checksum, namespace],
+                row_to_memory,
+            )
+            .optional()
+    }
+
+    pub fn all_memories_with_text_filtered_by_tag(
+        &self,
+        tag: &str,
+    ) -> SqlResult<Vec<(MemoryRecord, String)>> {
         self.all_memories_with_text_filtered_by_tag_ns(tag, "default")
     }
 
-    pub fn all_memories_with_text_filtered_by_tag_ns(&self, tag: &str, namespace: &str) -> SqlResult<Vec<(MemoryRecord, String)>> {
+    pub fn all_memories_with_text_filtered_by_tag_ns(
+        &self,
+        tag: &str,
+        namespace: &str,
+    ) -> SqlResult<Vec<(MemoryRecord, String)>> {
         let pattern = format!("%{}%", tag);
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, subject, relation, object, episode_text,
                     strength, embedding, created_at, last_accessed_at, access_count,
-                    tags, source, session_id, channel, importance, namespace, checksum
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
              FROM memories WHERE strength > 0.01 AND tags LIKE ?1 AND namespace = ?2",
         )?;
         let rows = stmt.query_map(params![pattern, namespace], |row| {
@@ -371,13 +645,39 @@ impl MemoryStore {
         })?;
         // Post-filter for exact tag match (LIKE is approximate)
         let all: Vec<(MemoryRecord, String)> = rows.collect::<SqlResult<Vec<_>>>()?;
-        Ok(all.into_iter().filter(|(m, _)| m.tags.iter().any(|t| t == tag)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|(m, _)| m.tags.iter().any(|t| t == tag))
+            .collect())
     }
 
-    pub fn touch_memory_with_strength(&self, id: i64, strength: f64, now: DateTime<Utc>) -> SqlResult<()> {
-        self.conn.execute(
-            "UPDATE memories SET last_accessed_at = ?1, access_count = access_count + 1, strength = ?2 WHERE id = ?3",
-            params![now.to_rfc3339(), strength.clamp(0.0, 1.0), id],
+    pub fn touch_memory_with_strength(
+        &self,
+        id: i64,
+        strength: f64,
+        now: DateTime<Utc>,
+    ) -> SqlResult<()> {
+        self.touch_memory_with_strength_context(id, strength, now, None)
+    }
+
+    pub fn touch_memory_with_strength_context(
+        &self,
+        id: i64,
+        strength: f64,
+        now: DateTime<Utc>,
+        context: Option<&serde_json::Value>,
+    ) -> SqlResult<()> {
+        self.with_write_retry("touch_memory_with_strength", || {
+            self.conn.execute(
+                "UPDATE memories SET last_accessed_at = ?1, access_count = access_count + 1, strength = ?2 WHERE id = ?3",
+                params![now.to_rfc3339(), strength.clamp(0.0, 1.0), id],
+            )
+        })?;
+        self.log_audit(
+            "recall_touch",
+            Some(id),
+            "system",
+            context.map(|c| c.to_string()).as_deref(),
         )?;
         Ok(())
     }
@@ -386,7 +686,7 @@ impl MemoryStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, subject, relation, object, episode_text,
                     strength, embedding, created_at, last_accessed_at, access_count,
-                    tags, source, session_id, channel, importance, namespace, checksum
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
              FROM memories WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], row_to_memory)?;
@@ -402,13 +702,25 @@ impl MemoryStore {
         self.decay_all_ns(decay_factor, half_life_hours, "default")
     }
 
-    pub fn decay_all_ns(&self, decay_factor: f64, half_life_hours: f64, namespace: &str) -> SqlResult<usize> {
+    pub fn decay_all_ns(
+        &self,
+        decay_factor: f64,
+        half_life_hours: f64,
+        namespace: &str,
+    ) -> SqlResult<usize> {
         let now = Utc::now();
         let mut stmt = self.conn.prepare(
             "SELECT id, last_accessed_at, strength, importance FROM memories WHERE strength > 0.01 AND namespace = ?1",
         )?;
         let rows: Vec<(i64, String, f64, f64)> = stmt
-            .query_map(params![namespace], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<f64>>(3)?.unwrap_or(0.5))))?
+            .query_map(params![namespace], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, Option<f64>>(3)?.unwrap_or(0.5),
+                ))
+            })?
             .collect::<SqlResult<Vec<_>>>()?;
 
         let mut count = 0;
@@ -422,12 +734,23 @@ impl MemoryStore {
             let effective_half_life = half_life_hours * (1.0 + importance);
             let new_strength = (strength * decay_factor.powf(hours / effective_half_life)).max(0.0);
             if (new_strength - strength).abs() > 1e-6 {
-                self.conn.execute("UPDATE memories SET strength = ?1 WHERE id = ?2", params![new_strength, id])?;
+                self.conn.execute(
+                    "UPDATE memories SET strength = ?1 WHERE id = ?2",
+                    params![new_strength, id],
+                )?;
                 count += 1;
             }
         }
         if count > 0 {
-            self.log_audit("decay", None, "system", Some(&format!("{{\"decayed\":{count},\"namespace\":{}}}", serde_json::json!(namespace))))?;
+            self.log_audit(
+                "decay",
+                None,
+                "system",
+                Some(&format!(
+                    "{{\"decayed\":{count},\"namespace\":{}}}",
+                    serde_json::json!(namespace)
+                )),
+            )?;
         }
         Ok(count)
     }
@@ -439,17 +762,44 @@ impl MemoryStore {
     }
 
     pub fn forget_by_subject_ns(&self, subject: &str, namespace: &str) -> SqlResult<usize> {
-        let count = self.conn.execute("DELETE FROM memories WHERE subject = ?1 AND namespace = ?2", params![subject, namespace])?;
+        let count = self.with_write_retry("forget_by_subject", || {
+            self.conn.execute(
+                "DELETE FROM memories WHERE subject = ?1 AND namespace = ?2",
+                params![subject, namespace],
+            )
+        })?;
         if count > 0 {
-            self.log_audit("forget", None, "system", Some(&format!("{{\"by\":\"subject\",\"subject\":{},\"count\":{},\"namespace\":{}}}", serde_json::json!(subject), count, serde_json::json!(namespace))))?;
+            self.log_audit(
+                "forget",
+                None,
+                "system",
+                Some(&format!(
+                    "{{\"by\":\"subject\",\"subject\":{},\"count\":{},\"namespace\":{}}}",
+                    serde_json::json!(subject),
+                    count,
+                    serde_json::json!(namespace)
+                )),
+            )?;
         }
         Ok(count)
     }
 
     pub fn forget_by_id(&self, id: &str) -> SqlResult<usize> {
-        let changed = self.conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        let changed =
+            self.with_write_retry("forget_by_id", || {
+                self.conn
+                    .execute("DELETE FROM memories WHERE id = ?1", params![id])
+            })?;
         if changed > 0 {
-            self.log_audit("forget", Some(id.parse::<i64>().unwrap_or(0)), "system", Some(&format!("{{\"by\":\"id\",\"id\":{}}}", serde_json::json!(id))))?;
+            self.log_audit(
+                "forget",
+                Some(id.parse::<i64>().unwrap_or(0)),
+                "system",
+                Some(&format!(
+                    "{{\"by\":\"id\",\"id\":{}}}",
+                    serde_json::json!(id)
+                )),
+            )?;
         }
         Ok(changed)
     }
@@ -460,9 +810,23 @@ impl MemoryStore {
 
     pub fn forget_older_than_ns(&self, duration: Duration, namespace: &str) -> SqlResult<usize> {
         let cutoff = (Utc::now() - duration).to_rfc3339();
-        let count = self.conn.execute("DELETE FROM memories WHERE created_at < ?1 AND namespace = ?2", params![cutoff, namespace])?;
+        let count = self.with_write_retry("forget_older_than", || {
+            self.conn.execute(
+                "DELETE FROM memories WHERE created_at < ?1 AND namespace = ?2",
+                params![cutoff, namespace],
+            )
+        })?;
         if count > 0 {
-            self.log_audit("forget", None, "system", Some(&format!("{{\"by\":\"older_than\",\"count\":{},\"namespace\":{}}}", count, serde_json::json!(namespace))))?;
+            self.log_audit(
+                "forget",
+                None,
+                "system",
+                Some(&format!(
+                    "{{\"by\":\"older_than\",\"count\":{},\"namespace\":{}}}",
+                    count,
+                    serde_json::json!(namespace)
+                )),
+            )?;
         }
         Ok(count)
     }
@@ -473,7 +837,7 @@ impl MemoryStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, subject, relation, object, episode_text,
                     strength, embedding, created_at, last_accessed_at, access_count,
-                    tags, source, session_id, channel, importance, namespace, checksum
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
              FROM memories WHERE embedding IS NULL",
         )?;
         let rows = stmt.query_map([], row_to_memory)?;
@@ -481,7 +845,10 @@ impl MemoryStore {
     }
 
     pub fn update_embedding(&self, id: i64, embedding: &[f32]) -> SqlResult<()> {
-        self.conn.execute("UPDATE memories SET embedding = ?1 WHERE id = ?2", params![embedding_to_blob(embedding), id])?;
+        self.conn.execute(
+            "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+            params![embedding_to_blob(embedding), id],
+        )?;
         Ok(())
     }
 
@@ -491,7 +858,7 @@ impl MemoryStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, subject, relation, object, episode_text,
                     strength, embedding, created_at, last_accessed_at, access_count,
-                    tags, source, session_id, channel, importance, namespace, checksum
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
              FROM memories",
         )?;
         let rows = stmt.query_map([], row_to_memory)?;
@@ -502,7 +869,7 @@ impl MemoryStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, subject, relation, object, episode_text,
                     strength, embedding, created_at, last_accessed_at, access_count,
-                    tags, source, session_id, channel, importance, namespace, checksum
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
              FROM memories WHERE namespace = ?1",
         )?;
         let rows = stmt.query_map(params![namespace], row_to_memory)?;
@@ -511,55 +878,147 @@ impl MemoryStore {
 
     #[allow(clippy::too_many_arguments)]
     pub fn import_fact(
-        &self, subject: &str, relation: &str, object: &str, strength: f64,
-        embedding: Option<&[f32]>, created_at: &str, last_accessed_at: &str, access_count: i64,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        strength: f64,
+        embedding: Option<&[f32]>,
+        created_at: &str,
+        last_accessed_at: &str,
+        access_count: i64,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
     ) -> SqlResult<i64> {
-        self.import_fact_ns(subject, relation, object, strength, embedding, created_at, last_accessed_at, access_count, tags, source, session_id, channel, "default")
+        self.import_fact_ns(
+            subject,
+            relation,
+            object,
+            strength,
+            embedding,
+            created_at,
+            last_accessed_at,
+            access_count,
+            tags,
+            source,
+            session_id,
+            channel,
+            "default",
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn import_fact_ns(
-        &self, subject: &str, relation: &str, object: &str, strength: f64,
-        embedding: Option<&[f32]>, created_at: &str, last_accessed_at: &str, access_count: i64,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        strength: f64,
+        embedding: Option<&[f32]>,
+        created_at: &str,
+        last_accessed_at: &str,
+        access_count: i64,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
         namespace: &str,
     ) -> SqlResult<i64> {
         let emb_blob = embedding.map(embedding_to_blob);
         let tags_str = tags.join(",");
         let content = format!("{subject} {relation} {object}");
         let checksum = compute_checksum(&content);
+        let temporal_json: Option<String> = None;
         self.conn.execute(
-            "INSERT INTO memories (kind, subject, relation, object, strength, embedding, created_at, last_accessed_at, access_count, tags, source, session_id, channel, namespace, checksum)
-             VALUES ('fact', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![subject, relation, object, strength, emb_blob, created_at, last_accessed_at, access_count, tags_str, source, session_id, channel, namespace, checksum],
+            "INSERT INTO memories (kind, subject, relation, object, strength, embedding, created_at, last_accessed_at, access_count, tags, source, session_id, channel, namespace, checksum, temporal_json)
+             VALUES ('fact', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![subject, relation, object, strength, emb_blob, created_at, last_accessed_at, access_count, tags_str, source, session_id, channel, namespace, checksum, temporal_json],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn import_episode(
-        &self, text: &str, strength: f64, embedding: Option<&[f32]>,
-        created_at: &str, last_accessed_at: &str, access_count: i64,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        text: &str,
+        strength: f64,
+        embedding: Option<&[f32]>,
+        created_at: &str,
+        last_accessed_at: &str,
+        access_count: i64,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
     ) -> SqlResult<i64> {
-        self.import_episode_ns(text, strength, embedding, created_at, last_accessed_at, access_count, tags, source, session_id, channel, "default")
+        self.import_episode_ns(
+            text,
+            strength,
+            embedding,
+            created_at,
+            last_accessed_at,
+            access_count,
+            tags,
+            source,
+            session_id,
+            channel,
+            "default",
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn import_episode_ns(
-        &self, text: &str, strength: f64, embedding: Option<&[f32]>,
-        created_at: &str, last_accessed_at: &str, access_count: i64,
-        tags: &[String], source: Option<&str>, session_id: Option<&str>, channel: Option<&str>,
+        &self,
+        text: &str,
+        strength: f64,
+        embedding: Option<&[f32]>,
+        created_at: &str,
+        last_accessed_at: &str,
+        access_count: i64,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
         namespace: &str,
     ) -> SqlResult<i64> {
         let emb_blob = embedding.map(embedding_to_blob);
         let tags_str = tags.join(",");
         let checksum = compute_checksum(text);
+        let temporal_json: Option<String> = None;
         self.conn.execute(
-            "INSERT INTO memories (kind, episode_text, strength, embedding, created_at, last_accessed_at, access_count, tags, source, session_id, channel, namespace, checksum)
-             VALUES ('episode', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![text, strength, emb_blob, created_at, last_accessed_at, access_count, tags_str, source, session_id, channel, namespace, checksum],
+            "INSERT INTO memories (kind, episode_text, strength, embedding, created_at, last_accessed_at, access_count, tags, source, session_id, channel, namespace, checksum, temporal_json)
+             VALUES ('episode', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![text, strength, emb_blob, created_at, last_accessed_at, access_count, tags_str, source, session_id, channel, namespace, checksum, temporal_json],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_action_ns(
+        &self,
+        text: &str,
+        strength: f64,
+        embedding: Option<&[f32]>,
+        created_at: &str,
+        last_accessed_at: &str,
+        access_count: i64,
+        tags: &[String],
+        source: Option<&str>,
+        session_id: Option<&str>,
+        channel: Option<&str>,
+        namespace: &str,
+    ) -> SqlResult<i64> {
+        let emb_blob = embedding.map(embedding_to_blob);
+        let tags_str = tags.join(",");
+        let checksum = compute_checksum(text);
+        let temporal_json: Option<String> = None;
+        self.conn.execute(
+            "INSERT INTO memories (kind, episode_text, strength, embedding, created_at, last_accessed_at, access_count, tags, source, session_id, channel, namespace, checksum, temporal_json)
+             VALUES ('action', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![text, strength, emb_blob, created_at, last_accessed_at, access_count, tags_str, source, session_id, channel, namespace, checksum, temporal_json],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -567,37 +1026,43 @@ impl MemoryStore {
     /// Update tags on an existing memory.
     pub fn update_tags(&self, id: i64, tags: &[String]) -> SqlResult<()> {
         let tags_str = tags.join(",");
-        self.conn.execute(
-            "UPDATE memories SET tags = ?1 WHERE id = ?2",
-            params![tags_str, id],
-        )?;
+        self.with_write_retry("update_tags", || {
+            self.conn.execute(
+                "UPDATE memories SET tags = ?1 WHERE id = ?2",
+                params![tags_str, id],
+            )
+        })?;
         Ok(())
     }
 
     /// Update the importance score of a memory.
     pub fn update_importance(&self, id: i64, importance: f64) -> SqlResult<()> {
-        self.conn.execute(
-            "UPDATE memories SET importance = ?1 WHERE id = ?2",
-            params![importance.clamp(0.0, 1.0), id],
-        )?;
+        self.with_write_retry("update_importance", || {
+            self.conn.execute(
+                "UPDATE memories SET importance = ?1 WHERE id = ?2",
+                params![importance.clamp(0.0, 1.0), id],
+            )
+        })?;
         Ok(())
     }
 
     /// Set strength to zero (archive) for a memory.
     pub fn archive_memory(&self, id: i64) -> SqlResult<()> {
-        self.conn.execute(
-            "UPDATE memories SET strength = 0.0 WHERE id = ?1",
-            params![id],
-        )?;
+        self.with_write_retry("archive_memory", || {
+            self.conn.execute(
+                "UPDATE memories SET strength = 0.0 WHERE id = ?1",
+                params![id],
+            )
+        })?;
         Ok(())
     }
 
     /// Delete a memory by numeric ID.
     pub fn delete_memory(&self, id: i64) -> SqlResult<()> {
-        self.conn.execute(
-            "DELETE FROM memories WHERE id = ?1",
-            params![id],
-        )?;
+        self.with_write_retry("delete_memory", || {
+            self.conn
+                .execute("DELETE FROM memories WHERE id = ?1", params![id])
+        })?;
         Ok(())
     }
 
@@ -623,12 +1088,19 @@ impl MemoryStore {
     /// Reinforce an existing memory's strength (clamped to 1.0) and bump access count.
     pub fn reinforce_memory(&self, id: i64, boost: f64) -> SqlResult<()> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "UPDATE memories SET strength = MIN(strength + ?1, 1.0), \
+        self.with_write_retry("reinforce_memory", || {
+            self.conn.execute(
+                "UPDATE memories SET strength = MIN(strength + ?1, 1.0), \
              last_accessed_at = ?2, access_count = access_count + 1 WHERE id = ?3",
-            params![boost, now, id],
-        )?;
-        self.log_audit("reinforce", Some(id), "system", Some(&format!("{{\"boost\":{boost}}}")))
+                params![boost, now, id],
+            )
+        })?;
+        self.log_audit(
+            "reinforce",
+            Some(id),
+            "system",
+            Some(&format!("{{\"boost\":{boost}}}")),
+        )
     }
 
     // ── Graph traversal ────────────────────────────────────────
@@ -638,7 +1110,7 @@ impl MemoryStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, subject, relation, object, episode_text,
                     strength, embedding, created_at, last_accessed_at, access_count,
-                    tags, source, session_id, channel, importance, namespace, checksum
+                    tags, source, session_id, channel, importance, namespace, checksum, temporal_json
              FROM memories WHERE kind = 'fact' AND (subject = ?1 OR object = ?1)",
         )?;
         let rows = stmt.query_map(params![entity], row_to_memory)?;
@@ -652,34 +1124,73 @@ impl MemoryStore {
     }
 
     pub fn stats_ns(&self, namespace: &str) -> SqlResult<MemoryStats> {
-        let total_memories: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories WHERE namespace = ?1", params![namespace], |r| r.get(0))?;
-        let total_facts: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories WHERE kind = 'fact' AND namespace = ?1", params![namespace], |r| r.get(0))?;
-        let total_episodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories WHERE kind = 'episode' AND namespace = ?1", params![namespace], |r| r.get(0))?;
-        let avg_strength: f64 = self.conn.query_row("SELECT COALESCE(AVG(strength), 0.0) FROM memories WHERE namespace = ?1", params![namespace], |r| r.get(0))?;
-        Ok(MemoryStats { total_memories, total_facts, total_episodes, avg_strength })
+        let total_memories: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+            params![namespace],
+            |r| r.get(0),
+        )?;
+        let total_facts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE kind = 'fact' AND namespace = ?1",
+            params![namespace],
+            |r| r.get(0),
+        )?;
+        let total_episodes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE kind = 'episode' AND namespace = ?1",
+            params![namespace],
+            |r| r.get(0),
+        )?;
+        let total_actions: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE kind = 'action' AND namespace = ?1",
+            params![namespace],
+            |r| r.get(0),
+        )?;
+        let avg_strength: f64 = self.conn.query_row(
+            "SELECT COALESCE(AVG(strength), 0.0) FROM memories WHERE namespace = ?1",
+            params![namespace],
+            |r| r.get(0),
+        )?;
+        Ok(MemoryStats {
+            total_memories,
+            total_facts,
+            total_episodes,
+            total_actions,
+            avg_strength,
+        })
     }
 
     /// Aggregate write-retry telemetry from audit log events.
     pub fn write_retry_stats(&self) -> SqlResult<WriteRetryStats> {
-        let mut stmt = self.conn.prepare(
-            "SELECT details_json FROM audit_log WHERE action = 'write_retry'",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT details_json FROM audit_log WHERE action = 'write_retry'")?;
 
         let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
         let mut out = WriteRetryStats::default();
+        let mut recovered_latencies: Vec<u64> = Vec::new();
+        let mut failed_latencies: Vec<u64> = Vec::new();
+        let mut op_recovered_latencies: std::collections::BTreeMap<String, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        let mut op_failed_latencies: std::collections::BTreeMap<String, Vec<u64>> =
+            std::collections::BTreeMap::new();
 
         for row in rows {
             let Some(details) = row? else { continue };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&details) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&details) else {
+                continue;
+            };
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or_default();
             let retries = v.get("retries").and_then(|r| r.as_u64()).unwrap_or(0) as usize;
+            let elapsed_ms = v.get("elapsed_ms").and_then(|r| r.as_u64());
             let operation = v
                 .get("operation")
                 .and_then(|o| o.as_str())
                 .unwrap_or("unknown")
                 .to_string();
 
-            let op = out.per_operation.entry(operation).or_insert_with(OperationWriteRetryStats::default);
+            let op = out
+                .per_operation
+                .entry(operation.clone())
+                .or_insert_with(OperationWriteRetryStats::default);
 
             match status {
                 "retrying" => {
@@ -691,14 +1202,41 @@ impl MemoryStore {
                     out.recovered_retries_total += retries;
                     op.recovered_events += 1;
                     op.recovered_retries_total += retries;
+                    if let Some(ms) = elapsed_ms {
+                        recovered_latencies.push(ms);
+                        op_recovered_latencies
+                            .entry(operation)
+                            .or_default()
+                            .push(ms);
+                    }
                 }
                 "failed" => {
                     out.failed_events += 1;
                     out.failed_retries_total += retries;
                     op.failed_events += 1;
                     op.failed_retries_total += retries;
+                    if let Some(ms) = elapsed_ms {
+                        failed_latencies.push(ms);
+                        op_failed_latencies.entry(operation).or_default().push(ms);
+                    }
                 }
                 _ => {}
+            }
+        }
+
+        out.recovered_latency_ms_p50 = percentile_u64(&mut recovered_latencies, 0.50);
+        out.recovered_latency_ms_p95 = percentile_u64(&mut recovered_latencies, 0.95);
+        out.failed_latency_ms_p50 = percentile_u64(&mut failed_latencies, 0.50);
+        out.failed_latency_ms_p95 = percentile_u64(&mut failed_latencies, 0.95);
+
+        for (op_name, op_stats) in &mut out.per_operation {
+            if let Some(samples) = op_recovered_latencies.get_mut(op_name) {
+                op_stats.recovered_latency_ms_p50 = percentile_u64(samples, 0.50);
+                op_stats.recovered_latency_ms_p95 = percentile_u64(samples, 0.95);
+            }
+            if let Some(samples) = op_failed_latencies.get_mut(op_name) {
+                op_stats.failed_latency_ms_p50 = percentile_u64(samples, 0.50);
+                op_stats.failed_latency_ms_p95 = percentile_u64(samples, 0.95);
             }
         }
 
@@ -706,15 +1244,26 @@ impl MemoryStore {
     }
     // ── Audit Log ─────────────────────────────────────────────
 
-    pub fn log_audit(&self, action: &str, memory_id: Option<i64>, actor: &str, details_json: Option<&str>) -> SqlResult<()> {
+    pub fn log_audit(
+        &self,
+        action: &str,
+        memory_id: Option<i64>,
+        actor: &str,
+        details_json: Option<&str>,
+    ) -> SqlResult<()> {
         let now = Utc::now().to_rfc3339();
 
         // Fetch the previous entry's hash for chaining (or use "genesis" for first)
-        let prev_hash: String = self.conn.query_row(
-            "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1",
-            [],
-            |row| row.get::<_, Option<String>>(0),
-        ).optional()?.flatten().unwrap_or_else(|| "genesis".to_string());
+        let prev_hash: String = self
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or_else(|| "genesis".to_string());
 
         // Compute entry_hash = hex(sha256(prev_hash | timestamp | action | memory_id | actor | details))
         let mid_str = memory_id.unwrap_or(0).to_string();
@@ -737,7 +1286,15 @@ impl MemoryStore {
             "SELECT id, timestamp, action, memory_id, actor, details_json, entry_hash
              FROM audit_log ORDER BY id ASC",
         )?;
-        let rows: Vec<(i64, String, String, Option<i64>, String, Option<String>, Option<String>)> = stmt
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get(0)?,
@@ -760,7 +1317,8 @@ impl MemoryStore {
             total += 1;
             let mid_str = memory_id.unwrap_or(0).to_string();
             let details_str = details_json.as_deref().unwrap_or("");
-            let chain_input = format!("{prev_hash}|{timestamp}|{action}|{mid_str}|{actor}|{details_str}");
+            let chain_input =
+                format!("{prev_hash}|{timestamp}|{action}|{mid_str}|{actor}|{details_str}");
             let expected_hash = compute_audit_hash(&chain_input);
 
             match stored_hash {
@@ -789,10 +1347,19 @@ impl MemoryStore {
             }
         }
 
-        Ok(AuditIntegrityResult { total, valid, tampered })
+        Ok(AuditIntegrityResult {
+            total,
+            valid,
+            tampered,
+        })
     }
 
-    pub fn get_audit_log(&self, limit: usize, memory_id: Option<i64>, actor: Option<&str>) -> SqlResult<Vec<AuditEntry>> {
+    pub fn get_audit_log(
+        &self,
+        limit: usize,
+        memory_id: Option<i64>,
+        actor: Option<&str>,
+    ) -> SqlResult<Vec<AuditEntry>> {
         let (sql, param_values) = build_audit_query(limit, memory_id, actor);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
@@ -820,11 +1387,24 @@ impl MemoryStore {
             "SELECT id, kind, subject, relation, object, episode_text, checksum
              FROM memories WHERE namespace = ?1",
         )?;
-        let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = stmt
+        let rows: Vec<(
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = stmt
             .query_map(params![namespace], |row| {
                 Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?,
-                    row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             })?
             .collect::<SqlResult<Vec<_>>>()?;
@@ -837,10 +1417,12 @@ impl MemoryStore {
         for (id, kind, subject, relation, object, episode_text, stored_checksum) in rows {
             total_checked += 1;
             let content = match kind.as_str() {
-                "fact" => format!("{} {} {}",
+                "fact" => format!(
+                    "{} {} {}",
                     subject.as_deref().unwrap_or(""),
                     relation.as_deref().unwrap_or(""),
-                    object.as_deref().unwrap_or("")),
+                    object.as_deref().unwrap_or("")
+                ),
                 _ => episode_text.unwrap_or_default(),
             };
             let actual_checksum = compute_checksum(&content);
@@ -862,16 +1444,79 @@ impl MemoryStore {
             }
         }
 
-        Ok(VerifyResult { total_checked, valid, corrupted, missing_checksum })
+        Ok(VerifyResult {
+            total_checked,
+            valid,
+            corrupted,
+            missing_checksum,
+        })
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────
 
+fn percentile_u64(samples: &mut [u64], percentile: f64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let clamped = percentile.clamp(0.0, 1.0);
+    let idx = ((samples.len() - 1) as f64 * clamped).round() as usize;
+    samples.get(idx).copied()
+}
+
 fn compute_audit_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn retry_jitter_pct_from_env() -> f64 {
+    std::env::var("CONCH_WRITE_RETRY_JITTER_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(WRITE_RETRY_JITTER_PCT)
+}
+
+fn idempotent_writes_enabled() -> bool {
+    std::env::var("CONCH_IDEMPOTENT_WRITES")
+        .ok()
+        .map(|v| {
+            let n = v.trim().to_ascii_lowercase();
+            matches!(n.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn apply_retry_jitter(base_ms: u64) -> u64 {
+    let pct = retry_jitter_pct_from_env();
+    if pct <= 0.0 || base_ms == 0 {
+        return base_ms;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter_window = ((base_ms as f64) * pct).round() as u64;
+    if jitter_window == 0 {
+        return base_ms;
+    }
+    let offset = nanos % (jitter_window + 1);
+    base_ms
+        .saturating_add(offset)
+        .min(WRITE_RETRY_MAX_BACKOFF_MS)
+}
+
+fn temporal_anchor_time() -> DateTime<FixedOffset> {
+    let now_utc = Utc::now();
+    if let Ok(tz_name) = std::env::var("CONCH_TIMEZONE") {
+        if let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() {
+            return now_utc.with_timezone(&tz).fixed_offset();
+        }
+    }
+    // Fall back to machine local offset when explicit timezone is not configured.
+    Local::now().with_timezone(&Local::now().offset().fix())
 }
 
 fn compute_checksum(content: &str) -> String {
@@ -885,7 +1530,11 @@ pub fn content_checksum(content: &str) -> String {
     compute_checksum(content)
 }
 
-fn build_audit_query(limit: usize, memory_id: Option<i64>, actor: Option<&str>) -> (String, Vec<String>) {
+fn build_audit_query(
+    limit: usize,
+    memory_id: Option<i64>,
+    actor: Option<&str>,
+) -> (String, Vec<String>) {
     let mut conditions = Vec::new();
     let mut param_values: Vec<String> = Vec::new();
 
@@ -936,7 +1585,9 @@ mod tests {
     fn remember_fact_with_tags_stores_and_retrieves() {
         let store = MemoryStore::open_in_memory().unwrap();
         let tags = vec!["preference".to_string(), "technical".to_string()];
-        let id = store.remember_fact_with_tags("Rust", "is", "fast", None, &tags).unwrap();
+        let id = store
+            .remember_fact_with_tags("Rust", "is", "fast", None, &tags)
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert_eq!(mem.tags, vec!["preference", "technical"]);
     }
@@ -945,7 +1596,9 @@ mod tests {
     fn remember_episode_with_tags_stores_and_retrieves() {
         let store = MemoryStore::open_in_memory().unwrap();
         let tags = vec!["decision".to_string()];
-        let id = store.remember_episode_with_tags("chose Rust over Go", None, &tags).unwrap();
+        let id = store
+            .remember_episode_with_tags("chose Rust over Go", None, &tags)
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert_eq!(mem.tags, vec!["decision"]);
     }
@@ -953,7 +1606,9 @@ mod tests {
     #[test]
     fn remember_without_tags_returns_empty_vec() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let id = store.remember_fact("Jared", "likes", "pizza", None).unwrap();
+        let id = store
+            .remember_fact("Jared", "likes", "pizza", None)
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert!(mem.tags.is_empty());
     }
@@ -965,7 +1620,9 @@ mod tests {
         let mem = store.get_memory(id).unwrap().unwrap();
         assert!(mem.tags.is_empty());
 
-        store.update_tags(id, &["technical".to_string(), "preference".to_string()]).unwrap();
+        store
+            .update_tags(id, &["technical".to_string(), "preference".to_string()])
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert_eq!(mem.tags, vec!["technical", "preference"]);
     }
@@ -974,7 +1631,9 @@ mod tests {
     fn tags_survive_export_import_roundtrip() {
         let store = MemoryStore::open_in_memory().unwrap();
         let tags = vec!["project".to_string(), "meta".to_string()];
-        store.remember_fact_with_tags("Conch", "is_a", "memory system", None, &tags).unwrap();
+        store
+            .remember_fact_with_tags("Conch", "is_a", "memory system", None, &tags)
+            .unwrap();
 
         let all = store.all_memories().unwrap();
         assert_eq!(all.len(), 1);
@@ -986,7 +1645,22 @@ mod tests {
         let created = mem.created_at.to_rfc3339();
         let accessed = mem.last_accessed_at.to_rfc3339();
         if let MemoryKind::Fact(f) = &mem.kind {
-            store2.import_fact(&f.subject, &f.relation, &f.object, mem.strength, None, &created, &accessed, mem.access_count, &mem.tags, None, None, None).unwrap();
+            store2
+                .import_fact(
+                    &f.subject,
+                    &f.relation,
+                    &f.object,
+                    mem.strength,
+                    None,
+                    &created,
+                    &accessed,
+                    mem.access_count,
+                    &mem.tags,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
         }
         let imported = store2.all_memories().unwrap();
         assert_eq!(imported.len(), 1);
@@ -997,7 +1671,9 @@ mod tests {
     fn tags_appear_in_all_memories_with_text() {
         let store = MemoryStore::open_in_memory().unwrap();
         let tags = vec!["person".to_string()];
-        store.remember_fact_with_tags("Jared", "is", "developer", None, &tags).unwrap();
+        store
+            .remember_fact_with_tags("Jared", "is", "developer", None, &tags)
+            .unwrap();
         let results = store.all_memories_with_text().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.tags, vec!["person"]);
@@ -1006,11 +1682,23 @@ mod tests {
     #[test]
     fn tag_filtered_recall_returns_only_matching() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_with_tags("A", "is", "tagged", None, &["technical".to_string()]).unwrap();
+        store
+            .remember_fact_with_tags("A", "is", "tagged", None, &["technical".to_string()])
+            .unwrap();
         store.remember_fact("B", "is", "untagged", None).unwrap();
-        store.remember_fact_with_tags("C", "is", "also-tagged", None, &["technical".to_string(), "project".to_string()]).unwrap();
+        store
+            .remember_fact_with_tags(
+                "C",
+                "is",
+                "also-tagged",
+                None,
+                &["technical".to_string(), "project".to_string()],
+            )
+            .unwrap();
 
-        let results = store.all_memories_with_text_filtered_by_tag("technical").unwrap();
+        let results = store
+            .all_memories_with_text_filtered_by_tag("technical")
+            .unwrap();
         assert_eq!(results.len(), 2);
         for (m, _) in &results {
             assert!(m.tags.contains(&"technical".to_string()));
@@ -1020,24 +1708,36 @@ mod tests {
     #[test]
     fn tag_filter_exact_match_not_substring() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_with_tags("A", "is", "tech", None, &["technical".to_string()]).unwrap();
-        store.remember_fact_with_tags("B", "is", "meta", None, &["meta".to_string()]).unwrap();
+        store
+            .remember_fact_with_tags("A", "is", "tech", None, &["technical".to_string()])
+            .unwrap();
+        store
+            .remember_fact_with_tags("B", "is", "meta", None, &["meta".to_string()])
+            .unwrap();
 
         // Filtering by "tech" should NOT match "technical"
-        let results = store.all_memories_with_text_filtered_by_tag("tech").unwrap();
+        let results = store
+            .all_memories_with_text_filtered_by_tag("tech")
+            .unwrap();
         assert_eq!(results.len(), 0);
 
         // Filtering by "meta" should match exactly
-        let results = store.all_memories_with_text_filtered_by_tag("meta").unwrap();
+        let results = store
+            .all_memories_with_text_filtered_by_tag("meta")
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn tag_filter_returns_empty_when_no_match() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_with_tags("A", "is", "B", None, &["technical".to_string()]).unwrap();
+        store
+            .remember_fact_with_tags("A", "is", "B", None, &["technical".to_string()])
+            .unwrap();
 
-        let results = store.all_memories_with_text_filtered_by_tag("nonexistent").unwrap();
+        let results = store
+            .all_memories_with_text_filtered_by_tag("nonexistent")
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1047,8 +1747,12 @@ mod tests {
     fn facts_involving_finds_subject_and_object() {
         let store = MemoryStore::open_in_memory().unwrap();
         store.remember_fact("Alice", "knows", "Bob", None).unwrap();
-        store.remember_fact("Bob", "works_at", "Acme", None).unwrap();
-        store.remember_fact("Charlie", "knows", "Alice", None).unwrap();
+        store
+            .remember_fact("Bob", "works_at", "Acme", None)
+            .unwrap();
+        store
+            .remember_fact("Charlie", "knows", "Alice", None)
+            .unwrap();
 
         // Alice appears as subject in fact 1, and object in fact 3
         let results = store.facts_involving("Alice").unwrap();
@@ -1087,10 +1791,18 @@ mod tests {
     #[test]
     fn remember_fact_full_stores_source_fields() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let id = store.remember_fact_full(
-            "Jared", "uses", "conch", None, &[],
-            Some("cli"), Some("session-123"), Some("#general"),
-        ).unwrap();
+        let id = store
+            .remember_fact_full(
+                "Jared",
+                "uses",
+                "conch",
+                None,
+                &[],
+                Some("cli"),
+                Some("session-123"),
+                Some("#general"),
+            )
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert_eq!(mem.source.as_deref(), Some("cli"));
         assert_eq!(mem.session_id.as_deref(), Some("session-123"));
@@ -1100,10 +1812,16 @@ mod tests {
     #[test]
     fn remember_episode_full_stores_source_fields() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let id = store.remember_episode_full(
-            "had a meeting", None, &[],
-            Some("discord"), Some("sess-abc"), Some("#dev"),
-        ).unwrap();
+        let id = store
+            .remember_episode_full(
+                "had a meeting",
+                None,
+                &[],
+                Some("discord"),
+                Some("sess-abc"),
+                Some("#dev"),
+            )
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert_eq!(mem.source.as_deref(), Some("discord"));
         assert_eq!(mem.session_id.as_deref(), Some("sess-abc"));
@@ -1123,10 +1841,18 @@ mod tests {
     #[test]
     fn source_fields_survive_export_import_roundtrip() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_full(
-            "Conch", "source_test", "value", None, &["meta".to_string()],
-            Some("cron"), Some("daily-job"), None,
-        ).unwrap();
+        store
+            .remember_fact_full(
+                "Conch",
+                "source_test",
+                "value",
+                None,
+                &["meta".to_string()],
+                Some("cron"),
+                Some("daily-job"),
+                None,
+            )
+            .unwrap();
 
         let all = store.all_memories().unwrap();
         assert_eq!(all.len(), 1);
@@ -1140,11 +1866,22 @@ mod tests {
         let created = mem.created_at.to_rfc3339();
         let accessed = mem.last_accessed_at.to_rfc3339();
         if let MemoryKind::Fact(f) = &mem.kind {
-            store2.import_fact(
-                &f.subject, &f.relation, &f.object, mem.strength, None,
-                &created, &accessed, mem.access_count, &mem.tags,
-                mem.source.as_deref(), mem.session_id.as_deref(), mem.channel.as_deref(),
-            ).unwrap();
+            store2
+                .import_fact(
+                    &f.subject,
+                    &f.relation,
+                    &f.object,
+                    mem.strength,
+                    None,
+                    &created,
+                    &accessed,
+                    mem.access_count,
+                    &mem.tags,
+                    mem.source.as_deref(),
+                    mem.session_id.as_deref(),
+                    mem.channel.as_deref(),
+                )
+                .unwrap();
         }
         let imported = store2.all_memories().unwrap();
         assert_eq!(imported.len(), 1);
@@ -1156,10 +1893,18 @@ mod tests {
     #[test]
     fn source_fields_appear_in_all_memories_with_text() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_full(
-            "test", "source", "recall", None, &[],
-            Some("mcp"), None, Some("#test-channel"),
-        ).unwrap();
+        store
+            .remember_fact_full(
+                "test",
+                "source",
+                "recall",
+                None,
+                &[],
+                Some("mcp"),
+                None,
+                Some("#test-channel"),
+            )
+            .unwrap();
         let results = store.all_memories_with_text().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.source.as_deref(), Some("mcp"));
@@ -1172,26 +1917,63 @@ mod tests {
     #[test]
     fn upsert_fact_inserts_when_no_match() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let (id, was_updated) = store.upsert_fact("Jared", "favorite_color", "blue", None, &[], None, None, None).unwrap();
+        let (id, was_updated) = store
+            .upsert_fact(
+                "Jared",
+                "favorite_color",
+                "blue",
+                None,
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         assert!(!was_updated);
         let mem = store.get_memory(id).unwrap().unwrap();
         if let MemoryKind::Fact(f) = &mem.kind {
             assert_eq!(f.object, "blue");
-        } else { panic!("expected fact"); }
+        } else {
+            panic!("expected fact");
+        }
     }
 
     #[test]
     fn upsert_fact_updates_existing_object() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let (id1, _) = store.upsert_fact("Jared", "favorite_color", "blue", None, &[], None, None, None).unwrap();
-        let (id2, was_updated) = store.upsert_fact("Jared", "favorite_color", "green", None, &[], None, None, None).unwrap();
+        let (id1, _) = store
+            .upsert_fact(
+                "Jared",
+                "favorite_color",
+                "blue",
+                None,
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (id2, was_updated) = store
+            .upsert_fact(
+                "Jared",
+                "favorite_color",
+                "green",
+                None,
+                &[],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         assert!(was_updated);
         assert_eq!(id1, id2, "should update the same row");
 
         let mem = store.get_memory(id2).unwrap().unwrap();
         if let MemoryKind::Fact(f) = &mem.kind {
             assert_eq!(f.object, "green", "object should be updated to green");
-        } else { panic!("expected fact"); }
+        } else {
+            panic!("expected fact");
+        }
 
         // Should only have 1 memory total
         let stats = store.stats().unwrap();
@@ -1201,17 +1983,28 @@ mod tests {
     #[test]
     fn upsert_fact_bumps_access_count() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.upsert_fact("Jared", "age", "30", None, &[], None, None, None).unwrap();
-        let (id, _) = store.upsert_fact("Jared", "age", "31", None, &[], None, None, None).unwrap();
+        store
+            .upsert_fact("Jared", "age", "30", None, &[], None, None, None)
+            .unwrap();
+        let (id, _) = store
+            .upsert_fact("Jared", "age", "31", None, &[], None, None, None)
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
-        assert_eq!(mem.access_count, 1, "access count should be bumped on upsert");
+        assert_eq!(
+            mem.access_count, 1,
+            "access count should be bumped on upsert"
+        );
     }
 
     #[test]
     fn upsert_fact_different_relation_creates_new() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let (id1, _) = store.upsert_fact("Jared", "likes", "Rust", None, &[], None, None, None).unwrap();
-        let (id2, was_updated) = store.upsert_fact("Jared", "uses", "Rust", None, &[], None, None, None).unwrap();
+        let (id1, _) = store
+            .upsert_fact("Jared", "likes", "Rust", None, &[], None, None, None)
+            .unwrap();
+        let (id2, was_updated) = store
+            .upsert_fact("Jared", "uses", "Rust", None, &[], None, None, None)
+            .unwrap();
         assert!(!was_updated, "different relation should insert new fact");
         assert_ne!(id1, id2);
         assert_eq!(store.stats().unwrap().total_memories, 2);
@@ -1220,8 +2013,30 @@ mod tests {
     #[test]
     fn upsert_fact_preserves_tags() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.upsert_fact("Jared", "color", "blue", None, &["preference".to_string()], None, None, None).unwrap();
-        let (id, _) = store.upsert_fact("Jared", "color", "green", None, &["preference".to_string(), "updated".to_string()], None, None, None).unwrap();
+        store
+            .upsert_fact(
+                "Jared",
+                "color",
+                "blue",
+                None,
+                &["preference".to_string()],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (id, _) = store
+            .upsert_fact(
+                "Jared",
+                "color",
+                "green",
+                None,
+                &["preference".to_string(), "updated".to_string()],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert_eq!(mem.tags, vec!["preference", "updated"]);
     }
@@ -1278,8 +2093,12 @@ mod tests {
     #[test]
     fn audit_log_records_upsert_update() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.upsert_fact("Jared", "color", "blue", None, &[], None, None, None).unwrap();
-        store.upsert_fact("Jared", "color", "green", None, &[], None, None, None).unwrap();
+        store
+            .upsert_fact("Jared", "color", "blue", None, &[], None, None, None)
+            .unwrap();
+        store
+            .upsert_fact("Jared", "color", "green", None, &[], None, None, None)
+            .unwrap();
 
         let log = store.get_audit_log(10, None, None).unwrap();
         assert!(log.iter().any(|e| e.action == "update"));
@@ -1302,11 +2121,20 @@ mod tests {
 
         // Make memory old so decay actually happens
         let old_time = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
-        store.conn().execute("UPDATE memories SET last_accessed_at = ?1", params![old_time]).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET last_accessed_at = ?1",
+                params![old_time],
+            )
+            .unwrap();
 
         store.decay_all(0.5, 24.0).unwrap();
         let log = store.get_audit_log(10, None, None).unwrap();
-        assert!(log.iter().any(|e| e.action == "decay"), "should log decay action");
+        assert!(
+            log.iter().any(|e| e.action == "decay"),
+            "should log decay action"
+        );
     }
 
     #[test]
@@ -1325,7 +2153,9 @@ mod tests {
     fn audit_log_filter_by_actor() {
         let store = MemoryStore::open_in_memory().unwrap();
         store.remember_fact("A", "B", "C", None).unwrap();
-        store.log_audit("custom_action", None, "agent-x", None).unwrap();
+        store
+            .log_audit("custom_action", None, "agent-x", None)
+            .unwrap();
 
         let log = store.get_audit_log(10, None, Some("agent-x")).unwrap();
         assert_eq!(log.len(), 1);
@@ -1336,7 +2166,9 @@ mod tests {
     fn audit_log_limit_works() {
         let store = MemoryStore::open_in_memory().unwrap();
         for i in 0..10 {
-            store.remember_fact(&format!("S{i}"), "R", "O", None).unwrap();
+            store
+                .remember_fact(&format!("S{i}"), "R", "O", None)
+                .unwrap();
         }
         let log = store.get_audit_log(3, None, None).unwrap();
         assert_eq!(log.len(), 3);
@@ -1376,11 +2208,18 @@ mod tests {
     #[test]
     fn checksum_is_consistent_for_same_content() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let id1 = store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1").unwrap();
-        let id2 = store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns2").unwrap();
+        let id1 = store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1")
+            .unwrap();
+        let id2 = store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns2")
+            .unwrap();
         let mem1 = store.get_memory(id1).unwrap().unwrap();
         let mem2 = store.get_memory(id2).unwrap().unwrap();
-        assert_eq!(mem1.checksum, mem2.checksum, "same content should produce same checksum");
+        assert_eq!(
+            mem1.checksum, mem2.checksum,
+            "same content should produce same checksum"
+        );
     }
 
     #[test]
@@ -1396,14 +2235,21 @@ mod tests {
     #[test]
     fn upsert_updates_checksum() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let (id, _) = store.upsert_fact("Jared", "color", "blue", None, &[], None, None, None).unwrap();
+        let (id, _) = store
+            .upsert_fact("Jared", "color", "blue", None, &[], None, None, None)
+            .unwrap();
         let mem1 = store.get_memory(id).unwrap().unwrap();
         let checksum1 = mem1.checksum.clone().unwrap();
 
-        store.upsert_fact("Jared", "color", "green", None, &[], None, None, None).unwrap();
+        store
+            .upsert_fact("Jared", "color", "green", None, &[], None, None, None)
+            .unwrap();
         let mem2 = store.get_memory(id).unwrap().unwrap();
         let checksum2 = mem2.checksum.clone().unwrap();
-        assert_ne!(checksum1, checksum2, "upsert with new object should change checksum");
+        assert_ne!(
+            checksum1, checksum2,
+            "upsert with new object should change checksum"
+        );
     }
 
     // ── Verify integrity tests ──────────────────────────────
@@ -1427,7 +2273,13 @@ mod tests {
         let id = store.remember_fact("Jared", "likes", "Rust", None).unwrap();
 
         // Corrupt the data
-        store.conn().execute("UPDATE memories SET object = 'Go' WHERE id = ?1", params![id]).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET object = 'Go' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
 
         let result = store.verify_integrity().unwrap();
         assert_eq!(result.corrupted.len(), 1);
@@ -1440,7 +2292,13 @@ mod tests {
         let id = store.remember_episode("original text", None).unwrap();
 
         // Corrupt the data
-        store.conn().execute("UPDATE memories SET episode_text = 'modified text' WHERE id = ?1", params![id]).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET episode_text = 'modified text' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
 
         let result = store.verify_integrity().unwrap();
         assert_eq!(result.corrupted.len(), 1);
@@ -1453,7 +2311,10 @@ mod tests {
         store.remember_fact("A", "B", "C", None).unwrap();
 
         // Null out checksum
-        store.conn().execute("UPDATE memories SET checksum = NULL", []).unwrap();
+        store
+            .conn()
+            .execute("UPDATE memories SET checksum = NULL", [])
+            .unwrap();
 
         let result = store.verify_integrity().unwrap();
         assert_eq!(result.missing_checksum, 1);
@@ -1464,11 +2325,21 @@ mod tests {
     #[test]
     fn verify_namespace_scoped() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns-a").unwrap();
-        store.remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns-b").unwrap();
+        store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns-a")
+            .unwrap();
+        store
+            .remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns-b")
+            .unwrap();
 
         // Corrupt ns-b data
-        store.conn().execute("UPDATE memories SET object = 'CORRUPTED' WHERE namespace = 'ns-b'", []).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET object = 'CORRUPTED' WHERE namespace = 'ns-b'",
+                [],
+            )
+            .unwrap();
 
         let result_a = store.verify_integrity_ns("ns-a").unwrap();
         let result_b = store.verify_integrity_ns("ns-b").unwrap();
@@ -1491,7 +2362,9 @@ mod tests {
     #[test]
     fn namespace_set_on_remember_ns() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let id = store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "project-x").unwrap();
+        let id = store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "project-x")
+            .unwrap();
         let mem = store.get_memory(id).unwrap().unwrap();
         assert_eq!(mem.namespace, "project-x");
     }
@@ -1499,8 +2372,12 @@ mod tests {
     #[test]
     fn namespace_isolates_all_memories_with_text() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1").unwrap();
-        store.remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2").unwrap();
+        store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2")
+            .unwrap();
 
         let ns1 = store.all_memories_with_text_ns("ns1").unwrap();
         let ns2 = store.all_memories_with_text_ns("ns2").unwrap();
@@ -1512,9 +2389,15 @@ mod tests {
     #[test]
     fn namespace_isolates_stats() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1").unwrap();
-        store.remember_fact_ns("D", "E", "F", None, &[], None, None, None, "ns1").unwrap();
-        store.remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2").unwrap();
+        store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .remember_fact_ns("D", "E", "F", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2")
+            .unwrap();
 
         let stats1 = store.stats_ns("ns1").unwrap();
         let stats2 = store.stats_ns("ns2").unwrap();
@@ -1525,24 +2408,46 @@ mod tests {
     #[test]
     fn namespace_isolates_upsert() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.upsert_fact_ns("Jared", "color", "blue", None, &[], None, None, None, "ns1").unwrap();
-        store.upsert_fact_ns("Jared", "color", "red", None, &[], None, None, None, "ns2").unwrap();
+        store
+            .upsert_fact_ns("Jared", "color", "blue", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .upsert_fact_ns("Jared", "color", "red", None, &[], None, None, None, "ns2")
+            .unwrap();
 
         // Upsert in ns1 should only update ns1
-        let (_, updated) = store.upsert_fact_ns("Jared", "color", "green", None, &[], None, None, None, "ns1").unwrap();
+        let (_, updated) = store
+            .upsert_fact_ns(
+                "Jared",
+                "color",
+                "green",
+                None,
+                &[],
+                None,
+                None,
+                None,
+                "ns1",
+            )
+            .unwrap();
         assert!(updated);
 
         let ns2_mems = store.all_memories_ns("ns2").unwrap();
         if let MemoryKind::Fact(f) = &ns2_mems[0].kind {
             assert_eq!(f.object, "red", "ns2 should be unaffected");
-        } else { panic!("expected fact"); }
+        } else {
+            panic!("expected fact");
+        }
     }
 
     #[test]
     fn namespace_isolates_forget_by_subject() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_ns("Jared", "likes", "A", None, &[], None, None, None, "ns1").unwrap();
-        store.remember_fact_ns("Jared", "likes", "B", None, &[], None, None, None, "ns2").unwrap();
+        store
+            .remember_fact_ns("Jared", "likes", "A", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .remember_fact_ns("Jared", "likes", "B", None, &[], None, None, None, "ns2")
+            .unwrap();
 
         let deleted = store.forget_by_subject_ns("Jared", "ns1").unwrap();
         assert_eq!(deleted, 1);
@@ -1555,26 +2460,63 @@ mod tests {
     #[test]
     fn namespace_isolates_decay() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1").unwrap();
-        store.remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2").unwrap();
+        store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2")
+            .unwrap();
 
         // Make all memories old
         let old_time = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
-        store.conn().execute("UPDATE memories SET last_accessed_at = ?1", params![old_time]).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET last_accessed_at = ?1",
+                params![old_time],
+            )
+            .unwrap();
 
         let decayed = store.decay_all_ns(0.5, 24.0, "ns1").unwrap();
         assert_eq!(decayed, 1, "should only decay ns1 memories");
 
         // ns2 should be untouched (strength still 1.0)
         let ns2_mems = store.all_memories_ns("ns2").unwrap();
-        assert!((ns2_mems[0].strength - 1.0).abs() < 0.01, "ns2 should not be decayed");
+        assert!(
+            (ns2_mems[0].strength - 1.0).abs() < 0.01,
+            "ns2 should not be decayed"
+        );
     }
 
     #[test]
     fn namespace_isolates_embeddings() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_ns("A", "B", "C", Some(&[1.0, 0.0]), &[], None, None, None, "ns1").unwrap();
-        store.remember_fact_ns("X", "Y", "Z", Some(&[0.0, 1.0]), &[], None, None, None, "ns2").unwrap();
+        store
+            .remember_fact_ns(
+                "A",
+                "B",
+                "C",
+                Some(&[1.0, 0.0]),
+                &[],
+                None,
+                None,
+                None,
+                "ns1",
+            )
+            .unwrap();
+        store
+            .remember_fact_ns(
+                "X",
+                "Y",
+                "Z",
+                Some(&[0.0, 1.0]),
+                &[],
+                None,
+                None,
+                None,
+                "ns2",
+            )
+            .unwrap();
 
         let emb1 = store.all_embeddings_ns("ns1").unwrap();
         let emb2 = store.all_embeddings_ns("ns2").unwrap();
@@ -1585,8 +2527,12 @@ mod tests {
     #[test]
     fn namespace_episode_isolation() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_episode_ns("event in ns1", None, &[], None, None, None, "ns1").unwrap();
-        store.remember_episode_ns("event in ns2", None, &[], None, None, None, "ns2").unwrap();
+        store
+            .remember_episode_ns("event in ns1", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .remember_episode_ns("event in ns2", None, &[], None, None, None, "ns2")
+            .unwrap();
 
         let ns1 = store.all_memories_with_text_ns("ns1").unwrap();
         let ns2 = store.all_memories_with_text_ns("ns2").unwrap();
@@ -1599,8 +2545,12 @@ mod tests {
     #[test]
     fn namespace_import_export_scoped() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1").unwrap();
-        store.remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2").unwrap();
+        store
+            .remember_fact_ns("A", "B", "C", None, &[], None, None, None, "ns1")
+            .unwrap();
+        store
+            .remember_fact_ns("X", "Y", "Z", None, &[], None, None, None, "ns2")
+            .unwrap();
 
         let ns1_mems = store.all_memories_ns("ns1").unwrap();
         assert_eq!(ns1_mems.len(), 1);
@@ -1620,7 +2570,10 @@ mod tests {
         let log = store.get_audit_log(1, None, None).unwrap();
         assert_eq!(log.len(), 1);
         let entry = &log[0];
-        assert!(entry.entry_hash.is_some(), "first entry should have an entry_hash");
+        assert!(
+            entry.entry_hash.is_some(),
+            "first entry should have an entry_hash"
+        );
         let hash = entry.entry_hash.as_ref().unwrap();
         assert!(!hash.is_empty(), "entry_hash must not be empty");
         // Verify the hash is 64 hex characters (sha256)
@@ -1637,7 +2590,10 @@ mod tests {
         let result = store.verify_audit_integrity().unwrap();
         assert_eq!(result.total, 2, "should have 2 audit entries");
         assert_eq!(result.valid, 2, "all entries should be valid");
-        assert!(result.tampered.is_empty(), "no tampering should be detected");
+        assert!(
+            result.tampered.is_empty(),
+            "no tampering should be detected"
+        );
     }
 
     /// 3. Multi-entry chain valid: store several entries, verify all pass.
@@ -1645,7 +2601,9 @@ mod tests {
     fn audit_hash_multi_entry_chain_valid() {
         let store = MemoryStore::open_in_memory().unwrap();
         for i in 0..5 {
-            store.remember_fact(&format!("S{i}"), "R", "O", None).unwrap();
+            store
+                .remember_fact(&format!("S{i}"), "R", "O", None)
+                .unwrap();
         }
         let result = store.verify_audit_integrity().unwrap();
         assert!(result.total >= 5, "should have at least 5 entries");
@@ -1689,7 +2647,10 @@ mod tests {
 
         // Verify the hash can be serialized to JSON
         let json = serde_json::to_string_pretty(&log).unwrap();
-        assert!(json.contains("entry_hash"), "JSON export should contain entry_hash");
+        assert!(
+            json.contains("entry_hash"),
+            "JSON export should contain entry_hash"
+        );
     }
 
     #[test]
@@ -1721,7 +2682,11 @@ mod tests {
             .into_iter()
             .filter(|e| e.action == "write_retry")
             .collect();
-        assert_eq!(write_retry_events.len(), 3, "two retry events + one recovered event");
+        assert_eq!(
+            write_retry_events.len(),
+            3,
+            "two retry events + one recovered event"
+        );
         let has_recovered = write_retry_events.iter().any(|e| {
             e.details_json
                 .as_ref()
@@ -1730,7 +2695,10 @@ mod tests {
                 .as_deref()
                 == Some("recovered")
         });
-        assert!(has_recovered, "expected at least one recovered write_retry event");
+        assert!(
+            has_recovered,
+            "expected at least one recovered write_retry event"
+        );
     }
 
     #[test]
@@ -1778,7 +2746,11 @@ mod tests {
             .into_iter()
             .filter(|e| e.action == "write_retry")
             .collect();
-        assert_eq!(write_retry_events.len(), WRITE_RETRY_ATTEMPTS, "retries plus terminal failure event");
+        assert_eq!(
+            write_retry_events.len(),
+            WRITE_RETRY_ATTEMPTS,
+            "retries plus terminal failure event"
+        );
         let has_failed = write_retry_events.iter().any(|e| {
             e.details_json
                 .as_ref()
@@ -1794,13 +2766,25 @@ mod tests {
     fn write_retry_stats_aggregate_events() {
         let store = MemoryStore::open_in_memory().unwrap();
 
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"retrying\",\"operation\":\"remember_fact\",\"attempt\":1}"))
+        store
+            .log_audit(
+                "write_retry",
+                None,
+                "system",
+                Some("{\"status\":\"retrying\",\"operation\":\"remember_fact\",\"attempt\":1}"),
+            )
             .unwrap();
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"retrying\",\"operation\":\"remember_fact\",\"attempt\":2}"))
+        store
+            .log_audit(
+                "write_retry",
+                None,
+                "system",
+                Some("{\"status\":\"retrying\",\"operation\":\"remember_fact\",\"attempt\":2}"),
+            )
             .unwrap();
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"recovered\",\"operation\":\"remember_fact\",\"retries\":2}"))
+        store.log_audit("write_retry", None, "system", Some("{\"status\":\"recovered\",\"operation\":\"remember_fact\",\"retries\":2,\"elapsed_ms\":75}"))
             .unwrap();
-        store.log_audit("write_retry", None, "system", Some("{\"status\":\"failed\",\"operation\":\"remember_episode\",\"retries\":3}"))
+        store.log_audit("write_retry", None, "system", Some("{\"status\":\"failed\",\"operation\":\"remember_episode\",\"retries\":3,\"elapsed_ms\":120}"))
             .unwrap();
 
         let stats = store.write_retry_stats().unwrap();
@@ -1809,15 +2793,42 @@ mod tests {
         assert_eq!(stats.failed_events, 1);
         assert_eq!(stats.recovered_retries_total, 2);
         assert_eq!(stats.failed_retries_total, 3);
+        assert_eq!(stats.recovered_latency_ms_p50, Some(75));
+        assert_eq!(stats.recovered_latency_ms_p95, Some(75));
+        assert_eq!(stats.failed_latency_ms_p50, Some(120));
+        assert_eq!(stats.failed_latency_ms_p95, Some(120));
 
         let fact = stats.per_operation.get("remember_fact").unwrap();
         assert_eq!(fact.retrying_events, 2);
         assert_eq!(fact.recovered_events, 1);
         assert_eq!(fact.failed_events, 0);
+        assert_eq!(fact.recovered_latency_ms_p50, Some(75));
+        assert_eq!(fact.recovered_latency_ms_p95, Some(75));
 
         let episode = stats.per_operation.get("remember_episode").unwrap();
         assert_eq!(episode.failed_events, 1);
         assert_eq!(episode.failed_retries_total, 3);
+        assert_eq!(episode.failed_latency_ms_p50, Some(120));
+        assert_eq!(episode.failed_latency_ms_p95, Some(120));
+    }
+
+    #[test]
+    fn remember_episode_stores_temporal_metadata_when_detected() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let id = store.remember_episode("remind me in 2 days", None).unwrap();
+        let mem = store.get_memory(id).unwrap().unwrap();
+        assert!(mem.temporal.is_some());
+        let t = mem.temporal.unwrap();
+        assert_eq!(t.status, "pending");
+        assert!(t.resolved_at > t.utterance_at);
+    }
+
+    #[test]
+    fn remember_fact_without_relative_time_has_no_temporal_metadata() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let id = store.remember_fact("Jared", "likes", "Rust", None).unwrap();
+        let mem = store.get_memory(id).unwrap().unwrap();
+        assert!(mem.temporal.is_none());
     }
 }
 
@@ -1829,7 +2840,10 @@ fn row_to_memory(row: &rusqlite::Row) -> SqlResult<MemoryRecord> {
             relation: row.get(3)?,
             object: row.get(4)?,
         }),
-        _ => MemoryKind::Episode(Episode {
+        "episode" => MemoryKind::Episode(Episode {
+            text: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        }),
+        _ => MemoryKind::Action(Action {
             text: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         }),
     };
@@ -1840,6 +2854,9 @@ fn row_to_memory(row: &rusqlite::Row) -> SqlResult<MemoryRecord> {
     } else {
         tags_str.split(',').map(|s| s.trim().to_string()).collect()
     };
+    let temporal: Option<TemporalMetadata> = row
+        .get::<_, Option<String>>(18)?
+        .and_then(|s| serde_json::from_str(&s).ok());
     Ok(MemoryRecord {
         id: row.get(0)?,
         kind,
@@ -1853,7 +2870,10 @@ fn row_to_memory(row: &rusqlite::Row) -> SqlResult<MemoryRecord> {
         session_id: row.get::<_, Option<String>>(13)?,
         channel: row.get::<_, Option<String>>(14)?,
         importance: row.get::<_, Option<f64>>(15)?.unwrap_or(0.5),
-        namespace: row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "default".to_string()),
+        namespace: row
+            .get::<_, Option<String>>(16)?
+            .unwrap_or_else(|| "default".to_string()),
         checksum: row.get::<_, Option<String>>(17)?,
+        temporal,
     })
 }

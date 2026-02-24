@@ -14,9 +14,15 @@ pub struct Episode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Action {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MemoryKind {
     Fact(Fact),
     Episode(Episode),
+    Action(Action),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +48,8 @@ pub struct MemoryRecord {
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<TemporalMetadata>,
 }
 
 fn default_importance() -> f64 {
@@ -53,10 +61,34 @@ fn default_namespace() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalMetadata {
+    pub raw_text: String,
+    pub utterance_at: DateTime<Utc>,
+    pub timezone: String,
+    pub resolved_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_end_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_temporal_kind")]
+    pub temporal_kind: String,
+    #[serde(default = "default_temporal_status")]
+    pub status: String,
+}
+
+fn default_temporal_kind() -> String {
+    "deadline".to_string()
+}
+
+fn default_temporal_status() -> String {
+    "pending".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryStats {
     pub total_memories: i64,
     pub total_facts: i64,
     pub total_episodes: i64,
+    #[serde(default)]
+    pub total_actions: i64,
     pub avg_strength: f64,
 }
 
@@ -67,6 +99,14 @@ pub struct WriteRetryStats {
     pub failed_events: usize,
     pub recovered_retries_total: usize,
     pub failed_retries_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_latency_ms_p50: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_latency_ms_p95: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_latency_ms_p50: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_latency_ms_p95: Option<u64>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub per_operation: std::collections::BTreeMap<String, OperationWriteRetryStats>,
 }
@@ -78,6 +118,14 @@ pub struct OperationWriteRetryStats {
     pub failed_events: usize,
     pub recovered_retries_total: usize,
     pub failed_retries_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_latency_ms_p50: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_latency_ms_p95: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_latency_ms_p50: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_latency_ms_p95: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,13 +251,14 @@ impl MemoryRecord {
         match &self.kind {
             MemoryKind::Fact(f) => format!("{} {} {}", f.subject, f.relation, f.object),
             MemoryKind::Episode(e) => e.text.clone(),
+            MemoryKind::Action(a) => a.text.clone(),
         }
     }
 
     pub fn subject(&self) -> Option<&str> {
         match &self.kind {
             MemoryKind::Fact(f) => Some(&f.subject),
-            MemoryKind::Episode(_) => None,
+            MemoryKind::Episode(_) | MemoryKind::Action(_) => None,
         }
     }
 
@@ -217,7 +266,7 @@ impl MemoryRecord {
     pub fn object(&self) -> Option<&str> {
         match &self.kind {
             MemoryKind::Fact(f) => Some(&f.object),
-            MemoryKind::Episode(_) => None,
+            MemoryKind::Episode(_) | MemoryKind::Action(_) => None,
         }
     }
 }
