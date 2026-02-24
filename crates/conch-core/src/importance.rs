@@ -47,6 +47,10 @@ pub fn compute_importance(mem: &MemoryRecord) -> f64 {
             let len = e.text.len() as f64;
             (len / 200.0).min(1.0)
         }
+        MemoryKind::Action(a) => {
+            let len = a.text.len() as f64;
+            (len / 250.0).min(0.8)
+        }
     };
     score += 0.35 * content_factor;
     weights += 0.35;
@@ -98,17 +102,26 @@ pub fn list_importance(store: &MemoryStore) -> Result<Vec<ImportanceInfo>, rusql
             }
         })
         .collect();
-    infos.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+    infos.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(infos)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::memory::{Episode, Fact, MemoryKind};
+    use chrono::Utc;
 
-    fn make_record(kind: MemoryKind, access_count: i64, tags: Vec<String>, source: Option<String>) -> MemoryRecord {
+    fn make_record(
+        kind: MemoryKind,
+        access_count: i64,
+        tags: Vec<String>,
+        source: Option<String>,
+    ) -> MemoryRecord {
         MemoryRecord {
             id: 1,
             kind,
@@ -124,18 +137,31 @@ mod tests {
             importance: 0.5,
             namespace: "default".to_string(),
             checksum: None,
+            temporal: None,
         }
     }
 
     #[test]
     fn high_access_count_increases_importance() {
         let low = make_record(
-            MemoryKind::Fact(Fact { subject: "A".into(), relation: "is".into(), object: "B".into() }),
-            0, vec![], None,
+            MemoryKind::Fact(Fact {
+                subject: "A".into(),
+                relation: "is".into(),
+                object: "B".into(),
+            }),
+            0,
+            vec![],
+            None,
         );
         let high = make_record(
-            MemoryKind::Fact(Fact { subject: "A".into(), relation: "is".into(), object: "B".into() }),
-            50, vec![], None,
+            MemoryKind::Fact(Fact {
+                subject: "A".into(),
+                relation: "is".into(),
+                object: "B".into(),
+            }),
+            50,
+            vec![],
+            None,
         );
         assert!(compute_importance(&high) > compute_importance(&low));
     }
@@ -143,12 +169,24 @@ mod tests {
     #[test]
     fn more_tags_increases_importance() {
         let no_tags = make_record(
-            MemoryKind::Fact(Fact { subject: "A".into(), relation: "is".into(), object: "B".into() }),
-            0, vec![], None,
+            MemoryKind::Fact(Fact {
+                subject: "A".into(),
+                relation: "is".into(),
+                object: "B".into(),
+            }),
+            0,
+            vec![],
+            None,
         );
         let with_tags = make_record(
-            MemoryKind::Fact(Fact { subject: "A".into(), relation: "is".into(), object: "B".into() }),
-            0, vec!["a".into(), "b".into(), "c".into()], None,
+            MemoryKind::Fact(Fact {
+                subject: "A".into(),
+                relation: "is".into(),
+                object: "B".into(),
+            }),
+            0,
+            vec!["a".into(), "b".into(), "c".into()],
+            None,
         );
         assert!(compute_importance(&with_tags) > compute_importance(&no_tags));
     }
@@ -156,12 +194,24 @@ mod tests {
     #[test]
     fn source_increases_importance() {
         let no_source = make_record(
-            MemoryKind::Fact(Fact { subject: "A".into(), relation: "is".into(), object: "B".into() }),
-            0, vec![], None,
+            MemoryKind::Fact(Fact {
+                subject: "A".into(),
+                relation: "is".into(),
+                object: "B".into(),
+            }),
+            0,
+            vec![],
+            None,
         );
         let with_source = make_record(
-            MemoryKind::Fact(Fact { subject: "A".into(), relation: "is".into(), object: "B".into() }),
-            0, vec![], Some("cli".into()),
+            MemoryKind::Fact(Fact {
+                subject: "A".into(),
+                relation: "is".into(),
+                object: "B".into(),
+            }),
+            0,
+            vec![],
+            Some("cli".into()),
         );
         assert!(compute_importance(&with_source) > compute_importance(&no_source));
     }
@@ -170,7 +220,9 @@ mod tests {
     fn longer_episodes_more_important() {
         let short = make_record(
             MemoryKind::Episode(Episode { text: "hi".into() }),
-            0, vec![], None,
+            0,
+            vec![],
+            None,
         );
         let long = make_record(
             MemoryKind::Episode(Episode { text: "This is a very detailed episode describing a complex technical decision about database architecture and schema migration patterns that was made after careful deliberation.".into() }),
@@ -183,11 +235,18 @@ mod tests {
     fn importance_is_bounded() {
         // Max everything out
         let maxed = make_record(
-            MemoryKind::Episode(Episode { text: "x".repeat(500) }),
-            1000, vec!["a".into(), "b".into(), "c".into(), "d".into()], Some("cli".into()),
+            MemoryKind::Episode(Episode {
+                text: "x".repeat(500),
+            }),
+            1000,
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            Some("cli".into()),
         );
         let imp = compute_importance(&maxed);
-        assert!(imp >= 0.0 && imp <= 1.0, "importance should be in [0, 1], got {imp}");
+        assert!(
+            imp >= 0.0 && imp <= 1.0,
+            "importance should be in [0, 1], got {imp}"
+        );
     }
 
     #[test]
@@ -196,15 +255,21 @@ mod tests {
         let id = store.remember_fact("A", "is", "B", None).unwrap();
 
         // Bump access count so importance changes from default
-        store.conn().execute(
-            "UPDATE memories SET access_count = 50 WHERE id = ?1",
-            rusqlite::params![id],
-        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET access_count = 50 WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
 
         let count = score_all(&store).unwrap();
         assert!(count > 0, "should have updated at least 1 memory");
 
         let mem = store.get_memory(id).unwrap().unwrap();
-        assert!(mem.importance != 0.5, "importance should have changed from default");
+        assert!(
+            mem.importance != 0.5,
+            "importance should have changed from default"
+        );
     }
 }

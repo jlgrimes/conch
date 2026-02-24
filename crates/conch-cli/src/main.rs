@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand};
-use conch_core::{ConchDB, ValidationEngine, ValidationConfig, DEFAULT_MYCELIUM_URL, isomorphic::RetrievalSource, memory::{MemoryKind, RememberResult}};
+use conch_core::{
+    isomorphic::RetrievalSource,
+    memory::{MemoryKind, RememberResult},
+    ConchDB, ValidationConfig, ValidationEngine, DEFAULT_MYCELIUM_URL,
+};
 use std::io;
 
 #[derive(Parser)]
@@ -57,6 +61,20 @@ enum Command {
         #[arg(long)]
         channel: Option<String>,
         /// Skip validation checks and store anyway (validation warnings are printed but not fatal)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Store an executed action (free-text operational event)
+    RememberAction {
+        text: String,
+        #[arg(long)]
+        tags: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
         #[arg(long)]
         force: bool,
     },
@@ -147,9 +165,7 @@ enum Command {
     /// Verify integrity of all memory checksums
     Verify,
     /// Validate text content without storing it
-    Validate {
-        text: String,
-    },
+    Validate { text: String },
     /// Verify audit log tamper-evidence chain
     VerifyAudit,
 }
@@ -161,9 +177,13 @@ fn default_db_path() -> String {
 
 fn parse_duration_secs(s: &str) -> Result<i64, String> {
     let s = s.trim();
-    if s.is_empty() { return Err("empty duration".to_string()); }
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
     let (num_str, suffix) = s.split_at(s.len() - 1);
-    let num: i64 = num_str.parse().map_err(|e| format!("invalid number: {e}"))?;
+    let num: i64 = num_str
+        .parse()
+        .map_err(|e| format!("invalid number: {e}"))?;
     if num <= 0 {
         return Err(format!("duration must be positive, got {num}"));
     }
@@ -179,7 +199,11 @@ fn parse_duration_secs(s: &str) -> Result<i64, String> {
 
 fn parse_tags(tags: Option<&str>) -> Vec<String> {
     match tags {
-        Some(s) if !s.is_empty() => s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
+        Some(s) if !s.is_empty() => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
         _ => vec![],
     }
 }
@@ -191,7 +215,10 @@ fn main() {
     }
     let db = match ConchDB::open_with_namespace(&cli.db, &cli.namespace) {
         Ok(db) => db,
-        Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     };
     if let Err(e) = run(&cli, &db) {
         eprintln!("Error: {e}");
@@ -201,7 +228,16 @@ fn main() {
 
 fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
-        Command::Remember { subject, relation, object, tags, source, session_id, channel, force } => {
+        Command::Remember {
+            subject,
+            relation,
+            object,
+            tags,
+            source,
+            session_id,
+            channel,
+            force,
+        } => {
             let tag_list = parse_tags(tags.as_deref());
             let src = Some(source.as_deref().unwrap_or("cli"));
             // Validation: warn but don't block (--force skips validation entirely)
@@ -210,29 +246,57 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                 let val_cfg = ValidationConfig::default();
                 let val_result = ValidationEngine::validate(&text, &val_cfg);
                 if !val_result.passed && !cli.quiet {
-                    eprintln!("⚠ Validation warning: {} violation(s) detected:", val_result.violations.len());
+                    eprintln!(
+                        "⚠ Validation warning: {} violation(s) detected:",
+                        val_result.violations.len()
+                    );
                     for v in &val_result.violations {
                         eprintln!("  - {v:?}");
                     }
                     eprintln!("  (storing anyway; use --force to suppress this warning)");
                 }
             }
-            let result = db.remember_fact_dedup_full(subject, relation, object, &tag_list, src, session_id.as_deref(), channel.as_deref())?;
-            if cli.json { println!("{}", serde_json::to_string_pretty(&result)?); }
-            else if !cli.quiet {
-                let tag_suffix = if tag_list.is_empty() { String::new() } else { format!(" [{}]", tag_list.join(", ")) };
+            let result = db.remember_fact_dedup_full(
+                subject,
+                relation,
+                object,
+                &tag_list,
+                src,
+                session_id.as_deref(),
+                channel.as_deref(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if !cli.quiet {
+                let tag_suffix = if tag_list.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tag_list.join(", "))
+                };
                 match &result {
-                    RememberResult::Created(_) => println!("Remembered: {subject} {relation} {object}{tag_suffix}"),
+                    RememberResult::Created(_) => {
+                        println!("Remembered: {subject} {relation} {object}{tag_suffix}")
+                    }
                     RememberResult::Updated(mem) => {
                         println!("Updated existing fact (id: {}): {subject} {relation} {object}{tag_suffix}", mem.id);
                     }
-                    RememberResult::Duplicate { existing, similarity } => {
+                    RememberResult::Duplicate {
+                        existing,
+                        similarity,
+                    } => {
                         println!("Duplicate detected (similarity: {similarity:.3}), reinforced existing memory (id: {}, strength: {:.2})", existing.id, existing.strength);
                     }
                 }
             }
         }
-        Command::RememberEpisode { text, tags, source, session_id, channel, force } => {
+        Command::RememberEpisode {
+            text,
+            tags,
+            source,
+            session_id,
+            channel,
+            force,
+        } => {
             let tag_list = parse_tags(tags.as_deref());
             let src = Some(source.as_deref().unwrap_or("cli"));
             // Validation: warn but don't block (--force skips validation entirely)
@@ -240,24 +304,69 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                 let val_cfg = ValidationConfig::default();
                 let val_result = ValidationEngine::validate(text, &val_cfg);
                 if !val_result.passed && !cli.quiet {
-                    eprintln!("⚠ Validation warning: {} violation(s) detected:", val_result.violations.len());
+                    eprintln!(
+                        "⚠ Validation warning: {} violation(s) detected:",
+                        val_result.violations.len()
+                    );
                     for v in &val_result.violations {
                         eprintln!("  - {v:?}");
                     }
                     eprintln!("  (storing anyway; use --force to suppress this warning)");
                 }
             }
-            let result = db.remember_episode_dedup_full(text, &tag_list, src, session_id.as_deref(), channel.as_deref())?;
-            if cli.json { println!("{}", serde_json::to_string_pretty(&result)?); }
-            else if !cli.quiet {
-                let tag_suffix = if tag_list.is_empty() { String::new() } else { format!(" [{}]", tag_list.join(", ")) };
+            let result = db.remember_episode_dedup_full(
+                text,
+                &tag_list,
+                src,
+                session_id.as_deref(),
+                channel.as_deref(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if !cli.quiet {
+                let tag_suffix = if tag_list.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tag_list.join(", "))
+                };
                 match &result {
-                    RememberResult::Created(_) => println!("Remembered episode: {text}{tag_suffix}"),
-                    RememberResult::Updated(mem) => println!("Updated existing memory (id: {}){tag_suffix}", mem.id),
-                    RememberResult::Duplicate { existing, similarity } => {
+                    RememberResult::Created(_) => {
+                        println!("Remembered episode: {text}{tag_suffix}")
+                    }
+                    RememberResult::Updated(mem) => {
+                        println!("Updated existing memory (id: {}){tag_suffix}", mem.id)
+                    }
+                    RememberResult::Duplicate {
+                        existing,
+                        similarity,
+                    } => {
                         println!("Duplicate detected (similarity: {similarity:.3}), reinforced existing memory (id: {}, strength: {:.2})", existing.id, existing.strength);
                     }
                 }
+            }
+        }
+        Command::RememberAction {
+            text,
+            tags,
+            source,
+            session_id,
+            channel,
+            force,
+        } => {
+            let tag_list = parse_tags(tags.as_deref());
+            let src = Some(source.as_deref().unwrap_or("cli"));
+            if !force {
+                let val_cfg = ValidationConfig::default();
+                let val_result = ValidationEngine::validate(text, &val_cfg);
+                if !val_result.passed && !cli.quiet {
+                    eprintln!("⚠ Validation warning: {} violation(s) detected:", val_result.violations.len());
+                }
+            }
+            let mem = db.remember_action_full(text, &tag_list, src, session_id.as_deref(), channel.as_deref())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&mem)?);
+            } else if !cli.quiet {
+                println!("Remembered action: {text}");
             }
         }
         Command::Recall { query, limit, tag } => {
@@ -265,17 +374,50 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else if !cli.quiet {
-                if results.is_empty() { println!("No memories found."); }
+                if results.is_empty() {
+                    println!("No memories found.");
+                }
                 for r in &results {
-                    let tag_suffix = if r.memory.tags.is_empty() { String::new() } else { format!(" [{}]", r.memory.tags.join(", ")) };
+                    let tag_suffix = if r.memory.tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", r.memory.tags.join(", "))
+                    };
+                    let explain = &r.explain;
+                    let rank_line = format!(
+                        "rrf#{} bm25#{} vec#{}",
+                        explain.rrf_rank,
+                        explain
+                            .bm25_rank
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        explain
+                            .vector_rank
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
                     match &r.memory.kind {
-                        MemoryKind::Fact(f) => println!("[fact] {} {} {} (str: {:.2}, score: {:.3}){tag_suffix}", f.subject, f.relation, f.object, r.memory.strength, r.score),
-                        MemoryKind::Episode(e) => println!("[episode] {} (str: {:.2}, score: {:.3}){tag_suffix}", e.text, r.memory.strength, r.score),
+                        MemoryKind::Fact(f) => println!(
+                            "[fact] {} {} {} (str: {:.2}, score: {:.3}, {}){tag_suffix}",
+                            f.subject, f.relation, f.object, r.memory.strength, r.score, rank_line
+                        ),
+                        MemoryKind::Episode(e) => println!(
+                            "[episode] {} (str: {:.2}, score: {:.3}, {}){tag_suffix}",
+                            e.text, r.memory.strength, r.score, rank_line
+                        ),
+                        MemoryKind::Action(a) => println!(
+                            "[action] {} (str: {:.2}, score: {:.3}, {}){tag_suffix}",
+                            a.text, r.memory.strength, r.score, rank_line
+                        ),
                     }
                 }
             }
         }
-        Command::RecallIsomorphic { query, limit, mycelium_url } => {
+        Command::RecallIsomorphic {
+            query,
+            limit,
+            mycelium_url,
+        } => {
             let url = mycelium_url.as_deref().unwrap_or(DEFAULT_MYCELIUM_URL);
             let result = db.recall_isomorphic(query, *limit, url)?;
             if cli.json {
@@ -303,12 +445,20 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                     println!("No memories found.");
                 } else {
                     for r in &result.results {
-                        let tag_suffix = if r.recall.memory.tags.is_empty() { String::new() } else { format!(" [{}]", r.recall.memory.tags.join(", ")) };
+                        let tag_suffix = if r.recall.memory.tags.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", r.recall.memory.tags.join(", "))
+                        };
                         let source_label = match &r.source {
                             RetrievalSource::Direct => "direct".to_string(),
                             RetrievalSource::AbstractShape => "pattern".to_string(),
                             RetrievalSource::Analogy(a) => {
-                                let short = if a.len() > 40 { format!("{}…", &a[..40]) } else { a.clone() };
+                                let short = if a.len() > 40 {
+                                    format!("{}…", &a[..40])
+                                } else {
+                                    a.clone()
+                                };
                                 format!("analogy: {short}")
                             }
                         };
@@ -321,39 +471,64 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                                 "[episode/{source_label}] {} (str: {:.2}, score: {:.3}){tag_suffix}",
                                 e.text, r.recall.memory.strength, r.recall.score
                             ),
+                            MemoryKind::Action(a) => println!(
+                                "[action/{source_label}] {} (str: {:.2}, score: {:.3}){tag_suffix}",
+                                a.text, r.recall.memory.strength, r.recall.score
+                            ),
                         }
                     }
                 }
             }
         }
-        Command::Forget { id, subject, older_than } => {
+        Command::Forget {
+            id,
+            subject,
+            older_than,
+        } => {
             if id.is_none() && subject.is_none() && older_than.is_none() {
                 return Err("specify --id, --subject, or --older-than".into());
             }
             let mut deleted = 0;
-            if let Some(mid) = id { deleted += db.forget_by_id(mid)?; }
-            if let Some(subj) = subject { deleted += db.forget_by_subject(subj)?; }
-            if let Some(dur) = older_than { deleted += db.forget_older_than(parse_duration_secs(dur)?)?; }
-            if cli.json { println!("{}", serde_json::json!({ "deleted": deleted })); }
-            else if !cli.quiet { println!("Deleted {deleted} memories."); }
+            if let Some(mid) = id {
+                deleted += db.forget_by_id(mid)?;
+            }
+            if let Some(subj) = subject {
+                deleted += db.forget_by_subject(subj)?;
+            }
+            if let Some(dur) = older_than {
+                deleted += db.forget_older_than(parse_duration_secs(dur)?)?;
+            }
+            if cli.json {
+                println!("{}", serde_json::json!({ "deleted": deleted }));
+            } else if !cli.quiet {
+                println!("Deleted {deleted} memories.");
+            }
         }
         Command::Decay => {
             let result = db.decay()?;
-            if cli.json { println!("{}", serde_json::to_string_pretty(&result)?); }
-            else if !cli.quiet { println!("Decayed {} memories.", result.decayed); }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if !cli.quiet {
+                println!("Decayed {} memories.", result.decayed);
+            }
         }
         Command::Stats => {
             let stats = db.stats()?;
             let retry_stats = db.write_retry_stats()?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "memory": stats,
-                    "write_retry": retry_stats,
-                }))?);
-            }
-            else if !cli.quiet {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "memory": stats,
+                        "write_retry": retry_stats,
+                    }))?
+                );
+            } else if !cli.quiet {
                 println!("Namespace: {}", cli.namespace);
-                println!("Memories: {} ({} facts, {} episodes)", stats.total_memories, stats.total_facts, stats.total_episodes);
+                println!(
+                    "Memories: {} ({} facts, {} episodes, {} actions)",
+                    stats.total_memories, stats.total_facts, stats.total_episodes, stats.total_actions
+                );
                 println!("Avg strength: {:.3}", stats.avg_strength);
                 println!(
                     "Write-retry telemetry: retrying={}, recovered={}, failed={}, recovered_retries_total={}, failed_retries_total={}",
@@ -363,17 +538,32 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                     retry_stats.recovered_retries_total,
                     retry_stats.failed_retries_total,
                 );
+                if retry_stats.recovered_latency_ms_p50.is_some()
+                    || retry_stats.failed_latency_ms_p50.is_some()
+                {
+                    println!(
+                        "Write-retry latency(ms): recovered(p50={:?}, p95={:?}) failed(p50={:?}, p95={:?})",
+                        retry_stats.recovered_latency_ms_p50,
+                        retry_stats.recovered_latency_ms_p95,
+                        retry_stats.failed_latency_ms_p50,
+                        retry_stats.failed_latency_ms_p95,
+                    );
+                }
                 if !retry_stats.per_operation.is_empty() {
                     println!("Per-operation retry telemetry:");
                     for (op, s) in &retry_stats.per_operation {
                         println!(
-                            "  - {}: retrying={}, recovered={}, failed={}, recovered_retries_total={}, failed_retries_total={}",
+                            "  - {}: retrying={}, recovered={}, failed={}, recovered_retries_total={}, failed_retries_total={}, rec_p50={:?}, rec_p95={:?}, fail_p50={:?}, fail_p95={:?}",
                             op,
                             s.retrying_events,
                             s.recovered_events,
                             s.failed_events,
                             s.recovered_retries_total,
                             s.failed_retries_total,
+                            s.recovered_latency_ms_p50,
+                            s.recovered_latency_ms_p95,
+                            s.failed_latency_ms_p50,
+                            s.failed_latency_ms_p95,
                         );
                     }
                 }
@@ -381,10 +571,14 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Embed => {
             let count = db.embed_all()?;
-            if cli.json { println!("{}", serde_json::json!({ "embedded": count })); }
-            else if !cli.quiet {
-                if count == 0 { println!("All memories have embeddings."); }
-                else { println!("Embedded {count} memories."); }
+            if cli.json {
+                println!("{}", serde_json::json!({ "embedded": count }));
+            } else if !cli.quiet {
+                if count == 0 {
+                    println!("All memories have embeddings.");
+                } else {
+                    println!("Embedded {count} memories.");
+                }
             }
         }
         Command::Related { subject, depth } => {
@@ -400,55 +594,84 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                         let indent = "  ".repeat(node.depth + 1);
                         match &node.memory.kind {
                             MemoryKind::Fact(f) => {
-                                println!("{indent}[hop {}] {} {} {} (via: {}, str: {:.2})",
-                                    node.depth, f.subject, f.relation, f.object,
-                                    node.connected_via, node.memory.strength);
+                                println!(
+                                    "{indent}[hop {}] {} {} {} (via: {}, str: {:.2})",
+                                    node.depth,
+                                    f.subject,
+                                    f.relation,
+                                    f.object,
+                                    node.connected_via,
+                                    node.memory.strength
+                                );
                             }
                             MemoryKind::Episode(e) => {
-                                println!("{indent}[hop {}] {} (via: {}, str: {:.2})",
-                                    node.depth, e.text, node.connected_via, node.memory.strength);
+                                println!(
+                                    "{indent}[hop {}] {} (via: {}, str: {:.2})",
+                                    node.depth, e.text, node.connected_via, node.memory.strength
+                                );
+                            }
+                            MemoryKind::Action(a) => {
+                                println!(
+                                    "{indent}[hop {}] {} (via: {}, str: {:.2})",
+                                    node.depth, a.text, node.connected_via, node.memory.strength
+                                );
                             }
                         }
                     }
                 }
             }
         }
-        Command::Why { id } => {
-            match db.why(*id)? {
-                Some(info) => {
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&info)?);
-                    } else if !cli.quiet {
-                        let mem = &info.memory;
-                        let kind_str = match &mem.kind {
-                            MemoryKind::Fact(f) => format!("fact: {} {} {}", f.subject, f.relation, f.object),
-                            MemoryKind::Episode(e) => format!("episode: {}", e.text),
-                        };
-                        println!("Memory #{} — {kind_str}", mem.id);
-                        println!("  Created:       {}", info.created_at);
-                        println!("  Last accessed:  {}", info.last_accessed_at);
-                        println!("  Access count:   {}", info.access_count);
-                        println!("  Strength:       {:.4}", info.strength);
-                        if let Some(src) = &info.source { println!("  Source:         {src}"); }
-                        if let Some(sid) = &info.session_id { println!("  Session:        {sid}"); }
-                        if let Some(ch) = &info.channel { println!("  Channel:        {ch}"); }
-                        if !mem.tags.is_empty() { println!("  Tags:           {}", mem.tags.join(", ")); }
-                        if !info.related.is_empty() {
-                            println!("  Related facts:");
-                            for node in &info.related {
-                                if let MemoryKind::Fact(f) = &node.memory.kind {
-                                    println!("    - {} {} {} (via: {})", f.subject, f.relation, f.object, node.connected_via);
-                                }
+        Command::Why { id } => match db.why(*id)? {
+            Some(info) => {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                } else if !cli.quiet {
+                    let mem = &info.memory;
+                    let kind_str = match &mem.kind {
+                        MemoryKind::Fact(f) => {
+                            format!("fact: {} {} {}", f.subject, f.relation, f.object)
+                        }
+                        MemoryKind::Episode(e) => format!("episode: {}", e.text),
+                        MemoryKind::Action(a) => format!("action: {}", a.text),
+                    };
+                    println!("Memory #{} — {kind_str}", mem.id);
+                    println!("  Created:       {}", info.created_at);
+                    println!("  Last accessed:  {}", info.last_accessed_at);
+                    println!("  Access count:   {}", info.access_count);
+                    println!("  Strength:       {:.4}", info.strength);
+                    if let Some(src) = &info.source {
+                        println!("  Source:         {src}");
+                    }
+                    if let Some(sid) = &info.session_id {
+                        println!("  Session:        {sid}");
+                    }
+                    if let Some(ch) = &info.channel {
+                        println!("  Channel:        {ch}");
+                    }
+                    if !mem.tags.is_empty() {
+                        println!("  Tags:           {}", mem.tags.join(", "));
+                    }
+                    if !info.related.is_empty() {
+                        println!("  Related facts:");
+                        for node in &info.related {
+                            if let MemoryKind::Fact(f) = &node.memory.kind {
+                                println!(
+                                    "    - {} {} {} (via: {})",
+                                    f.subject, f.relation, f.object, node.connected_via
+                                );
                             }
                         }
                     }
                 }
-                None => {
-                    if cli.json { println!("{}", serde_json::json!({ "error": "not found" })); }
-                    else if !cli.quiet { println!("Memory #{id} not found."); }
+            }
+            None => {
+                if cli.json {
+                    println!("{}", serde_json::json!({ "error": "not found" }));
+                } else if !cli.quiet {
+                    println!("Memory #{id} not found.");
                 }
             }
-        }
+        },
         Command::Export => {
             let data = db.export()?;
             println!("{}", serde_json::to_string_pretty(&data)?);
@@ -457,8 +680,11 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
             let input = std::io::read_to_string(io::stdin())?;
             let data: conch_core::ExportData = serde_json::from_str(&input)?;
             let count = db.import(&data)?;
-            if cli.json { println!("{}", serde_json::json!({ "imported": count })); }
-            else if !cli.quiet { println!("Imported {count} memories."); }
+            if cli.json {
+                println!("{}", serde_json::json!({ "imported": count }));
+            } else if !cli.quiet {
+                println!("Imported {count} memories.");
+            }
         }
         Command::Consolidate { dry_run } => {
             if *dry_run {
@@ -469,20 +695,34 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                     if clusters.is_empty() {
                         println!("No clusters found for consolidation.");
                     } else {
-                        println!("Found {} cluster(s) (dry run — no changes made):", clusters.len());
+                        println!(
+                            "Found {} cluster(s) (dry run — no changes made):",
+                            clusters.len()
+                        );
                         for (i, cluster) in clusters.iter().enumerate() {
                             println!("\n  Cluster {}:", i + 1);
-                            println!("    Canonical: [id:{}] {} (str: {:.2})", cluster.canonical.id, cluster.canonical.text_for_embedding(), cluster.canonical.strength);
+                            println!(
+                                "    Canonical: [id:{}] {} (str: {:.2})",
+                                cluster.canonical.id,
+                                cluster.canonical.text_for_embedding(),
+                                cluster.canonical.strength
+                            );
                             for dup in &cluster.duplicates {
-                                println!("    Duplicate: [id:{}] {} (str: {:.2})", dup.id, dup.text_for_embedding(), dup.strength);
+                                println!(
+                                    "    Duplicate: [id:{}] {} (str: {:.2})",
+                                    dup.id,
+                                    dup.text_for_embedding(),
+                                    dup.strength
+                                );
                             }
                         }
                     }
                 }
             } else {
                 let result = db.consolidate(false)?;
-                if cli.json { println!("{}", serde_json::to_string_pretty(&result)?); }
-                else if !cli.quiet {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else if !cli.quiet {
                     println!("Consolidated {} cluster(s): {} memories archived, {} canonical memories boosted.", result.clusters, result.archived, result.boosted);
                 }
             }
@@ -490,37 +730,69 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
         Command::Importance { id, set, score } => {
             if let (Some(mem_id), Some(value)) = (id, set) {
                 db.set_importance(*mem_id, *value)?;
-                if cli.json { println!("{}", serde_json::json!({ "id": mem_id, "importance": value })); }
-                else if !cli.quiet { println!("Set importance for memory {mem_id} to {value:.2}"); }
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "id": mem_id, "importance": value })
+                    );
+                } else if !cli.quiet {
+                    println!("Set importance for memory {mem_id} to {value:.2}");
+                }
             } else if *score {
                 let count = db.score_importance()?;
-                if cli.json { println!("{}", serde_json::json!({ "scored": count })); }
-                else if !cli.quiet { println!("Recomputed importance for {count} memories."); }
+                if cli.json {
+                    println!("{}", serde_json::json!({ "scored": count }));
+                } else if !cli.quiet {
+                    println!("Recomputed importance for {count} memories.");
+                }
             } else {
                 let infos = db.list_importance()?;
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&infos)?);
                 } else if !cli.quiet {
-                    if infos.is_empty() { println!("No memories found."); }
+                    if infos.is_empty() {
+                        println!("No memories found.");
+                    }
                     for info in &infos {
-                        println!("[id:{}] importance: {:.3} | accesses: {} | tags: {} | source: {} | {}",
-                            info.id, info.importance, info.access_count, info.tag_count,
+                        println!(
+                            "[id:{}] importance: {:.3} | accesses: {} | tags: {} | source: {} | {}",
+                            info.id,
+                            info.importance,
+                            info.access_count,
+                            info.tag_count,
                             if info.has_source { "yes" } else { "no" },
-                            truncate(&info.content, 60));
+                            truncate(&info.content, 60)
+                        );
                     }
                 }
             }
         }
-        Command::Log { limit, memory_id, actor } => {
+        Command::Log {
+            limit,
+            memory_id,
+            actor,
+        } => {
             let entries = db.audit_log(*limit, *memory_id, actor.as_deref())?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
             } else if !cli.quiet {
-                if entries.is_empty() { println!("No audit log entries."); }
+                if entries.is_empty() {
+                    println!("No audit log entries.");
+                }
                 for e in &entries {
-                    let mid = e.memory_id.map(|id| format!(" mem:{id}")).unwrap_or_default();
+                    let mid = e
+                        .memory_id
+                        .map(|id| format!(" mem:{id}"))
+                        .unwrap_or_default();
                     let details = e.details_json.as_deref().unwrap_or("");
-                    println!("[{}] {} ({}){} {}", e.timestamp.format("%Y-%m-%d %H:%M:%S"), e.action, e.actor, mid, details);
+                    println!(
+                        "[{}] {} ({}){} {}",
+                        e.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                        e.action,
+                        e.actor,
+                        mid,
+                        details
+                    );
                 }
             }
         }
@@ -537,7 +809,10 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     println!("CORRUPTED: {} memories", result.corrupted.len());
                     for c in &result.corrupted {
-                        println!("  id: {} expected: {} actual: {}", c.id, c.expected, c.actual);
+                        println!(
+                            "  id: {} expected: {} actual: {}",
+                            c.id, c.expected, c.actual
+                        );
                     }
                 }
             }
@@ -555,7 +830,10 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                 if result.passed {
                     println!("✓ Validation passed — no issues detected.");
                 } else {
-                    println!("✗ Validation failed — {} violation(s):", result.violations.len());
+                    println!(
+                        "✗ Validation failed — {} violation(s):",
+                        result.violations.len()
+                    );
                     for v in &result.violations {
                         println!("  - {v:?}");
                     }
@@ -572,9 +850,15 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
                 if result.tampered.is_empty() {
                     println!("✓ Audit log integrity verified — no tampering detected.");
                 } else {
-                    println!("✗ TAMPERED: {} entries have broken hash chains:", result.tampered.len());
+                    println!(
+                        "✗ TAMPERED: {} entries have broken hash chains:",
+                        result.tampered.len()
+                    );
                     for t in &result.tampered {
-                        println!("  id: {} expected: {} actual: {}", t.id, t.expected, t.actual);
+                        println!(
+                            "  id: {} expected: {} actual: {}",
+                            t.id, t.expected, t.actual
+                        );
                     }
                 }
             }
@@ -584,5 +868,9 @@ fn run(cli: &Cli, db: &ConchDB) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
 }

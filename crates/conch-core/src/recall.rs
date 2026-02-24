@@ -16,12 +16,21 @@ const RRF_K: f64 = 60.0;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RecallScoreExplain {
     pub rrf_score: f64,
+    pub rrf_rank: usize,
+    pub rrf_rank_percentile: f64,
+    pub bm25_rank: Option<usize>,
+    pub bm25_score: Option<f32>,
+    pub vector_rank: Option<usize>,
+    pub vector_similarity: Option<f32>,
+    pub modality_agreement: bool,
+    pub matched_modalities: usize,
     pub decayed_strength: f64,
     pub recency_boost: f64,
     pub access_weight: f64,
     pub base_score: f64,
     pub spread_boost: f64,
     pub temporal_boost: f64,
+    pub score_margin_to_next: Option<f64>,
     pub final_score: f64,
 }
 
@@ -39,10 +48,12 @@ pub struct RecallResult {
 /// so tuning affects all memories immediately.
 const FACT_DECAY_LAMBDA_PER_DAY: f64 = 0.02;
 const EPISODE_DECAY_LAMBDA_PER_DAY: f64 = 0.06;
+const ACTION_DECAY_LAMBDA_PER_DAY: f64 = 0.09;
 
 /// Reinforcement boost applied when a memory is touched.
 const FACT_TOUCH_BOOST: f64 = 0.10;
 const EPISODE_TOUCH_BOOST: f64 = 0.20;
+const ACTION_TOUCH_BOOST: f64 = 0.25;
 
 /// Overfetch multiplier for candidate reranking.
 const CANDIDATE_MULTIPLIER: usize = 10;
@@ -123,14 +134,13 @@ pub fn recall_with_tag_filter_ns(
     tag_filter: Option<&str>,
     namespace: &str,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let mut all_memories = store.all_memories_with_text_ns(namespace).map_err(RecallError::Db)?;
+    let mut all_memories = store
+        .all_memories_with_text_ns(namespace)
+        .map_err(RecallError::Db)?;
 
     // If a tag filter is specified, only keep memories that have the tag.
     if let Some(tag) = tag_filter {
-        let tag_lower = tag.to_lowercase();
-        all_memories.retain(|(mem, _)| {
-            mem.tags.iter().any(|t| t.to_lowercase() == tag_lower)
-        });
+        all_memories.retain(|(mem, _)| mem.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)));
     }
 
     if all_memories.is_empty() {
@@ -148,42 +158,71 @@ pub fn recall_with_tag_filter_ns(
 
     let coeffs = recall_score_coefficients_from_env();
 
+    // Overfetch candidates, then rerank with full score (including decay,
+    // recency, and access weighting) to avoid top-K cutoff errors.
+    let candidate_count = (limit.saturating_mul(CANDIDATE_MULTIPLIER))
+        .max(MIN_CANDIDATES)
+        .min(all_memories.len());
+
     // BM25
-    let bm25_ranked = bm25_search(query, &all_memories);
+    let bm25_ranked = bm25_search(query, &all_memories, candidate_count);
+    let bm25_meta: HashMap<usize, (usize, f32)> = bm25_ranked
+        .iter()
+        .enumerate()
+        .map(|(rank, (idx, score))| (*idx, (rank + 1, *score)))
+        .collect();
 
     // Vector
     let query_embedding = embedder
         .embed_one(query)
         .map_err(|e| RecallError::Embedding(e.to_string()))?;
-    let vector_ranked = vector_search(&query_embedding, &all_memories);
+    let vector_ranked = vector_search(&query_embedding, &all_memories, candidate_count);
+    let vector_meta: HashMap<usize, (usize, f32)> = vector_ranked
+        .iter()
+        .enumerate()
+        .map(|(rank, (idx, sim))| (*idx, (rank + 1, *sim)))
+        .collect();
 
     // RRF fusion
     let fused = rrf(&bm25_ranked, &vector_ranked);
-
-    // Overfetch candidates, then rerank with full score (including decay,
-    // recency, and access weighting) to avoid top-K cutoff errors.
-    let candidate_count = (limit.saturating_mul(CANDIDATE_MULTIPLIER)).max(MIN_CANDIDATES);
-    let candidates = fused.into_iter().take(candidate_count);
+    let candidates = fused.into_iter().take(candidate_count).enumerate();
 
     // Score = RRF × decayed_strength × recency_boost × access_weight
     let mut results: Vec<RecallResult> = candidates
-        .map(|(idx, rrf_score)| {
+        .map(|(rrf_rank, (idx, rrf_score))| {
             let mem = &all_memories[idx].0;
             let decayed_strength = effective_strength(mem, now);
             let recency = recency_boost(mem, now);
             let access = access_weight(mem, max_access);
-            let base_score = compute_base_score(rrf_score, decayed_strength, recency, access, coeffs);
+            let base_score =
+                compute_base_score(rrf_score, decayed_strength, recency, access, coeffs);
+            let temporal_multiplier = temporal_relevance_multiplier(mem, now);
+            let salience_multiplier = operational_salience_multiplier(mem, query, now);
+            let scored = base_score * temporal_multiplier * salience_multiplier;
+            let bm25 = bm25_meta.get(&idx).copied();
+            let vector = vector_meta.get(&idx).copied();
+            let matched_modalities = usize::from(bm25.is_some()) + usize::from(vector.is_some());
             RecallResult {
                 memory: mem.clone(),
-                score: base_score,
+                score: scored,
                 explain: RecallScoreExplain {
                     rrf_score,
+                    rrf_rank: rrf_rank + 1,
+                    rrf_rank_percentile: ((rrf_rank + 1) as f64 / candidate_count as f64)
+                        .clamp(0.0, 1.0),
+                    bm25_rank: bm25.map(|(rank, _)| rank),
+                    bm25_score: bm25.map(|(_, score)| score),
+                    vector_rank: vector.map(|(rank, _)| rank),
+                    vector_similarity: vector.map(|(_, sim)| sim),
+                    modality_agreement: bm25.is_some() && vector.is_some(),
+                    matched_modalities,
                     decayed_strength,
                     recency_boost: recency,
                     access_weight: access,
                     base_score,
                     spread_boost: 0.0,
-                    temporal_boost: 0.0,
+                    temporal_boost: (scored - base_score).max(0.0),
+                    score_margin_to_next: None,
                     final_score: base_score,
                 },
             }
@@ -206,20 +245,41 @@ pub fn recall_with_tag_filter_ns(
     let before_temporal: Vec<f64> = results.iter().map(|r| r.score).collect();
     temporal_cooccurrence_boost(&mut results);
     for (i, r) in results.iter_mut().enumerate() {
-        r.explain.temporal_boost = (r.score - before_temporal[i]).max(0.0);
+        r.explain.temporal_boost += (r.score - before_temporal[i]).max(0.0);
         r.explain.final_score = r.score;
     }
 
     sort_recall_results(&mut results);
     results.truncate(limit);
+    for i in 0..results.len() {
+        let margin = if i + 1 < results.len() {
+            Some((results[i].score - results[i + 1].score).max(0.0))
+        } else {
+            None
+        };
+        results[i].explain.score_margin_to_next = margin;
+    }
 
     // Touch recalled memories: apply decay first, then reinforce.
     for result in &results {
         let mem = &result.memory;
         let decayed = effective_strength(mem, now);
-        let boosted = (decayed + touch_boost(mem)).min(1.0);
+        let boosted = if is_expired_pending_temporal(mem, now) {
+            0.0
+        } else {
+            (decayed + touch_boost(mem)).min(1.0)
+        };
+        let context = serde_json::json!({
+            "query": query,
+            "namespace": namespace,
+            "final_score": result.score,
+            "rrf_rank": result.explain.rrf_rank,
+            "bm25_rank": result.explain.bm25_rank,
+            "vector_rank": result.explain.vector_rank,
+            "modality_agreement": result.explain.modality_agreement,
+        });
         store
-            .touch_memory_with_strength(mem.id, boosted, now)
+            .touch_memory_with_strength_context(mem.id, boosted, now, Some(&context))
             .map_err(RecallError::Db)?;
     }
 
@@ -234,7 +294,13 @@ pub fn recall_with_tag_filter_ns(
 fn recency_boost(mem: &MemoryRecord, now: chrono::DateTime<Utc>) -> f64 {
     let hours_ago = (now - mem.created_at).num_seconds().max(0) as f64 / 3600.0;
     let raw = 1.0 / (1.0 + (hours_ago / RECENCY_HALF_LIFE_HOURS).powf(0.8));
-    raw.max(RECENCY_FLOOR)
+    let kind_multiplier = match &mem.kind {
+        MemoryKind::Action(_) => {
+            if hours_ago <= 48.0 { 1.35 } else if hours_ago <= 24.0 * 7.0 { 1.10 } else { 0.75 }
+        }
+        _ => 1.0,
+    };
+    (raw.max(RECENCY_FLOOR) * kind_multiplier).max(RECENCY_FLOOR)
 }
 
 /// Access pattern weight: memories recalled more often are more consolidated
@@ -362,9 +428,7 @@ fn temporal_cooccurrence_boost(results: &mut Vec<RecallResult>) {
             if j == *ai {
                 continue;
             }
-            let gap_minutes = (*a_time - r.memory.created_at)
-                .num_minutes()
-                .unsigned_abs() as f64;
+            let gap_minutes = (*a_time - r.memory.created_at).num_minutes().unsigned_abs() as f64;
             if gap_minutes < 30.0 {
                 let proximity = 0.1 * (1.0 - gap_minutes / 30.0);
                 *boosts.entry(j).or_insert(0.0) += a_score * proximity;
@@ -383,6 +447,7 @@ fn kind_decay_lambda_per_day(mem: &MemoryRecord) -> f64 {
     match &mem.kind {
         MemoryKind::Fact(_) => FACT_DECAY_LAMBDA_PER_DAY,
         MemoryKind::Episode(_) => EPISODE_DECAY_LAMBDA_PER_DAY,
+        MemoryKind::Action(_) => ACTION_DECAY_LAMBDA_PER_DAY,
     }
 }
 
@@ -390,10 +455,14 @@ fn touch_boost(mem: &MemoryRecord) -> f64 {
     match &mem.kind {
         MemoryKind::Fact(_) => FACT_TOUCH_BOOST,
         MemoryKind::Episode(_) => EPISODE_TOUCH_BOOST,
+        MemoryKind::Action(_) => ACTION_TOUCH_BOOST,
     }
 }
 
 fn effective_strength(mem: &MemoryRecord, now: chrono::DateTime<Utc>) -> f64 {
+    if is_expired_pending_temporal(mem, now) {
+        return 0.0;
+    }
     let elapsed_secs = (now - mem.last_accessed_at).num_seconds().max(0) as f64;
     let elapsed_days = elapsed_secs / 86_400.0;
     let lambda = kind_decay_lambda_per_day(mem);
@@ -403,7 +472,83 @@ fn effective_strength(mem: &MemoryRecord, now: chrono::DateTime<Utc>) -> f64 {
     (mem.strength * (-effective_lambda * elapsed_days).exp()).clamp(0.0, 1.0)
 }
 
-fn bm25_search(query: &str, memories: &[(MemoryRecord, String)]) -> Vec<(usize, f32)> {
+fn is_expired_pending_temporal(mem: &MemoryRecord, now: chrono::DateTime<Utc>) -> bool {
+    let Some(temporal) = &mem.temporal else {
+        return false;
+    };
+    if !temporal.status.eq_ignore_ascii_case("pending") {
+        return false;
+    }
+    let end = temporal.resolved_end_at.unwrap_or(temporal.resolved_at);
+    end <= now
+}
+
+fn temporal_relevance_multiplier(mem: &MemoryRecord, now: chrono::DateTime<Utc>) -> f64 {
+    let Some(t) = &mem.temporal else {
+        return 1.0;
+    };
+    if !t.status.eq_ignore_ascii_case("pending") {
+        return 1.0;
+    }
+    if is_expired_pending_temporal(mem, now) {
+        return 0.0;
+    }
+
+    // Range-like temporal intent (e.g., end-of-month windows): relevance increases
+    // as we approach window start, peaks while inside the window.
+    if let Some(end) = t.resolved_end_at {
+        if now >= t.resolved_at && now <= end {
+            return 1.6;
+        }
+        if now < t.resolved_at {
+            let total = (t.resolved_at - t.utterance_at).num_seconds().max(1) as f64;
+            let elapsed = (now - t.utterance_at).num_seconds().clamp(0, total as i64) as f64;
+            let progress = (elapsed / total).clamp(0.0, 1.0);
+            return 1.0 + 0.7 * progress;
+        }
+        return 0.0;
+    }
+
+    // Deadline-like: increase relevance as due date approaches.
+    let hrs_to_due = (t.resolved_at - now).num_seconds().max(0) as f64 / 3600.0;
+    if hrs_to_due <= 24.0 {
+        1.8
+    } else if hrs_to_due <= 24.0 * 7.0 {
+        1.4
+    } else if hrs_to_due <= 24.0 * 30.0 {
+        1.15
+    } else {
+        1.0
+    }
+}
+
+fn operational_salience_multiplier(mem: &MemoryRecord, query: &str, now: chrono::DateTime<Utc>) -> f64 {
+    let q = query.to_ascii_lowercase();
+    let text = mem.text_for_embedding().to_ascii_lowercase();
+
+    let has_ops_signal = ["api key", "self-host", "self hosted", "credential", "token", "deploy", "plane", "dns", "cron", "server"]
+        .iter()
+        .any(|k| text.contains(k) || q.contains(k))
+        || mem.tags.iter().any(|t| {
+            let t = t.to_ascii_lowercase();
+            ["ops", "operational", "infra", "infrastructure", "credentials", "deployment", "status"].contains(&t.as_str())
+        });
+
+    match &mem.kind {
+        MemoryKind::Fact(_) if has_ops_signal => {
+            let age_days = (now - mem.created_at).num_seconds().max(0) as f64 / 86_400.0;
+            if age_days <= 90.0 { 1.35 } else { 1.15 }
+        }
+        MemoryKind::Action(_) => 1.10,
+        _ => 1.0,
+    }
+}
+
+fn bm25_search(
+    query: &str,
+    memories: &[(MemoryRecord, String)],
+    search_limit: usize,
+) -> Vec<(usize, f32)> {
     use bm25::{Document, Language, SearchEngineBuilder};
 
     let documents: Vec<Document<usize>> = memories
@@ -421,13 +566,17 @@ fn bm25_search(query: &str, memories: &[(MemoryRecord, String)]) -> Vec<(usize, 
             .build();
 
     engine
-        .search(query, memories.len())
+        .search(query, search_limit.max(1).min(memories.len()))
         .into_iter()
         .map(|r| (r.document.id, r.score))
         .collect()
 }
 
-fn vector_search(query_emb: &[f32], memories: &[(MemoryRecord, String)]) -> Vec<(usize, f32)> {
+fn vector_search(
+    query_emb: &[f32],
+    memories: &[(MemoryRecord, String)],
+    search_limit: usize,
+) -> Vec<(usize, f32)> {
     let mut scored: Vec<(usize, f32)> = memories
         .iter()
         .enumerate()
@@ -443,6 +592,7 @@ fn vector_search(query_emb: &[f32], memories: &[(MemoryRecord, String)]) -> Vec<
         .collect();
 
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(search_limit.max(1).min(scored.len()));
     scored
 }
 
@@ -504,12 +654,21 @@ mod tests {
     fn test_explain(score: f64) -> RecallScoreExplain {
         RecallScoreExplain {
             rrf_score: score,
+            rrf_rank: 1,
+            rrf_rank_percentile: 1.0,
+            bm25_rank: None,
+            bm25_score: None,
+            vector_rank: None,
+            vector_similarity: None,
+            modality_agreement: false,
+            matched_modalities: 0,
             decayed_strength: 1.0,
             recency_boost: 1.0,
             access_weight: 1.0,
             base_score: score,
             spread_boost: 0.0,
             temporal_boost: 0.0,
+            score_margin_to_next: None,
             final_score: score,
         }
     }
@@ -517,7 +676,9 @@ mod tests {
     #[test]
     fn effective_strength_decays_by_kind() {
         let store = MemoryStore::open_in_memory().unwrap();
-        let fact_id = store.remember_fact("Jared", "builds", "Gen", Some(&[1.0, 0.0])).unwrap();
+        let fact_id = store
+            .remember_fact("Jared", "builds", "Gen", Some(&[1.0, 0.0]))
+            .unwrap();
         let ep_id = store
             .remember_episode("alpha project context", Some(&[1.0, 0.0]))
             .unwrap();
@@ -537,6 +698,33 @@ mod tests {
         let sf = effective_strength(&fact, Utc::now());
         let se = effective_strength(&episode, Utc::now());
         assert!(sf > se, "facts should decay slower than episodes");
+    }
+
+    #[test]
+    fn effective_strength_zero_for_expired_pending_temporal() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let id = store
+            .remember_episode("follow up in 1 day", Some(&[1.0, 0.0]))
+            .unwrap();
+
+        let expired = serde_json::json!({
+            "raw_text": "in 1 day",
+            "utterance_at": (Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+            "timezone": "-06:00",
+            "resolved_at": (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+            "status": "pending"
+        })
+        .to_string();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET temporal_json = ?1 WHERE id = ?2",
+                rusqlite::params![expired, id],
+            )
+            .unwrap();
+
+        let mem = store.get_memory(id).unwrap().unwrap();
+        assert_eq!(effective_strength(&mem, Utc::now()), 0.0);
     }
 
     // ── Recency boost tests ────────────────────────────────────
@@ -592,7 +780,12 @@ mod tests {
 
         let mem = store.get_memory(id).unwrap().unwrap();
         let boost = recency_boost(&mem, now);
-        assert!(boost >= RECENCY_FLOOR, "recency boost {} should be >= floor {}", boost, RECENCY_FLOOR);
+        assert!(
+            boost >= RECENCY_FLOOR,
+            "recency boost {} should be >= floor {}",
+            boost,
+            RECENCY_FLOOR
+        );
     }
 
     // ── Access weight tests ──────────────────────────────────
@@ -624,9 +817,22 @@ mod tests {
         let hot_w = access_weight(&hot, 20);
         let cold_w = access_weight(&cold, 20);
 
-        assert!(hot_w > cold_w, "hot ({}) should weigh more than cold ({})", hot_w, cold_w);
-        assert!(hot_w >= 1.0 && hot_w <= 2.0, "access weight should be in [1.0, 2.0], got {}", hot_w);
-        assert!(cold_w >= 1.0, "cold access weight should be >= 1.0, got {}", cold_w);
+        assert!(
+            hot_w > cold_w,
+            "hot ({}) should weigh more than cold ({})",
+            hot_w,
+            cold_w
+        );
+        assert!(
+            hot_w >= 1.0 && hot_w <= 2.0,
+            "access weight should be in [1.0, 2.0], got {}",
+            hot_w
+        );
+        assert!(
+            cold_w >= 1.0,
+            "cold access weight should be >= 1.0, got {}",
+            cold_w
+        );
     }
 
     #[test]
@@ -721,13 +927,11 @@ mod tests {
 
     #[test]
     fn spreading_activation_does_not_self_boost() {
-        let mut results = vec![
-            RecallResult {
-                memory: make_fact_record(1, "Jared", "builds", "Gen"),
-                score: 1.0,
-                explain: test_explain(1.0),
-            },
-        ];
+        let mut results = vec![RecallResult {
+            memory: make_fact_record(1, "Jared", "builds", "Gen"),
+            score: 1.0,
+            explain: test_explain(1.0),
+        }];
 
         spread_activation(&mut results, SPREAD_FACTOR);
         // Single result — no self-boost possible
@@ -747,12 +951,20 @@ mod tests {
                 explain: test_explain(1.0),
             },
             RecallResult {
-                memory: make_timed_episode(2, "alpha nearby memory", now - chrono::Duration::minutes(5)),
+                memory: make_timed_episode(
+                    2,
+                    "alpha nearby memory",
+                    now - chrono::Duration::minutes(5),
+                ),
                 score: 0.2,
                 explain: test_explain(0.2),
             },
             RecallResult {
-                memory: make_timed_episode(3, "alpha distant memory", now - chrono::Duration::hours(3)),
+                memory: make_timed_episode(
+                    3,
+                    "alpha distant memory",
+                    now - chrono::Duration::hours(3),
+                ),
                 score: 0.2,
                 explain: test_explain(0.2),
             },
@@ -786,7 +998,11 @@ mod tests {
                 explain: test_explain(1.0),
             },
             RecallResult {
-                memory: make_timed_episode(2, "alpha very close", now - chrono::Duration::minutes(2)),
+                memory: make_timed_episode(
+                    2,
+                    "alpha very close",
+                    now - chrono::Duration::minutes(2),
+                ),
                 score: 0.1,
                 explain: test_explain(0.1),
             },
@@ -858,6 +1074,27 @@ mod tests {
     }
 
     #[test]
+    fn explainability_includes_rank_metadata() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .remember_fact("Jared", "likes", "alpha", Some(&[1.0, 0.0]))
+            .unwrap();
+        store
+            .remember_episode("alpha launch notes", Some(&[1.0, 0.0]))
+            .unwrap();
+
+        let results = recall(&store, "alpha", &MockEmbedder, 5).unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            assert!(r.explain.rrf_rank >= 1);
+            assert!((0.0..=1.0).contains(&r.explain.rrf_rank_percentile));
+            assert!(r.explain.bm25_rank.is_some() || r.explain.vector_rank.is_some());
+            assert!(r.explain.matched_modalities <= 2);
+            assert_eq!(r.explain.modality_agreement, r.explain.matched_modalities == 2);
+        }
+    }
+
+    #[test]
     fn coefficient_tuning_changes_base_score_tradeoff() {
         // Candidate A: strong recency/access, weaker semantic score
         let a = (0.70_f64, 0.95_f64, 0.95_f64, 1.80_f64);
@@ -867,7 +1104,10 @@ mod tests {
         let default = RecallScoreCoefficients::default();
         let a_default = compute_base_score(a.0, a.1, a.2, a.3, default);
         let b_default = compute_base_score(b.0, b.1, b.2, b.3, default);
-        assert!(a_default > b_default, "default coeffs should favor fresher/high-access memory");
+        assert!(
+            a_default > b_default,
+            "default coeffs should favor fresher/high-access memory"
+        );
 
         let semantic_heavy = RecallScoreCoefficients {
             rrf_exp: 2.0,
@@ -877,7 +1117,10 @@ mod tests {
         };
         let a_semantic = compute_base_score(a.0, a.1, a.2, a.3, semantic_heavy);
         let b_semantic = compute_base_score(b.0, b.1, b.2, b.3, semantic_heavy);
-        assert!(b_semantic > a_semantic, "semantic-heavy coeffs should flip ranking preference");
+        assert!(
+            b_semantic > a_semantic,
+            "semantic-heavy coeffs should flip ranking preference"
+        );
     }
 
     // ── Integration: full pipeline test ──────────────────────
@@ -888,11 +1131,17 @@ mod tests {
         let now = Utc::now();
 
         // Create a cluster of related facts about a topic
-        store.remember_fact("Jared", "has_pet", "Tortellini", Some(&[1.0, 0.0])).unwrap();
-        store.remember_fact("Tortellini", "is_a", "dog", Some(&[1.0, 0.0])).unwrap();
+        store
+            .remember_fact("Jared", "has_pet", "Tortellini", Some(&[1.0, 0.0]))
+            .unwrap();
+        store
+            .remember_fact("Tortellini", "is_a", "dog", Some(&[1.0, 0.0]))
+            .unwrap();
 
         // Create an old, unrelated memory
-        let old_id = store.remember_fact("weather", "is", "sunny", Some(&[0.5, 0.5])).unwrap();
+        let old_id = store
+            .remember_fact("weather", "is", "sunny", Some(&[0.5, 0.5]))
+            .unwrap();
         let old_time = (now - chrono::Duration::days(60)).to_rfc3339();
         store
             .conn()
@@ -936,6 +1185,7 @@ mod tests {
             importance: 0.5,
             namespace: "default".to_string(),
             checksum: None,
+            temporal: None,
         }
     }
 
@@ -957,6 +1207,7 @@ mod tests {
             importance: 0.5,
             namespace: "default".to_string(),
             checksum: None,
+            temporal: None,
         }
     }
 
@@ -996,21 +1247,41 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
 
         // Create two memories: one tagged, one not
-        store.remember_fact_with_tags("Jared", "likes", "alpha", Some(&[1.0, 0.0]), &["preference".to_string()]).unwrap();
-        store.remember_fact_with_tags("Jared", "uses", "alpha", Some(&[1.0, 0.0]), &["technical".to_string()]).unwrap();
-        store.remember_fact("weather", "is", "alpha", Some(&[1.0, 0.0])).unwrap();
+        store
+            .remember_fact_with_tags(
+                "Jared",
+                "likes",
+                "alpha",
+                Some(&[1.0, 0.0]),
+                &["preference".to_string()],
+            )
+            .unwrap();
+        store
+            .remember_fact_with_tags(
+                "Jared",
+                "uses",
+                "alpha",
+                Some(&[1.0, 0.0]),
+                &["technical".to_string()],
+            )
+            .unwrap();
+        store
+            .remember_fact("weather", "is", "alpha", Some(&[1.0, 0.0]))
+            .unwrap();
 
         // Without filter: should find all 3
         let all_results = recall(&store, "alpha", &MockEmbedder, 10).unwrap();
         assert_eq!(all_results.len(), 3);
 
         // With "preference" filter: should find only 1
-        let filtered = recall_with_tag_filter(&store, "alpha", &MockEmbedder, 10, Some("preference")).unwrap();
+        let filtered =
+            recall_with_tag_filter(&store, "alpha", &MockEmbedder, 10, Some("preference")).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].memory.tags, vec!["preference"]);
 
         // With "technical" filter: should find only 1
-        let filtered = recall_with_tag_filter(&store, "alpha", &MockEmbedder, 10, Some("technical")).unwrap();
+        let filtered =
+            recall_with_tag_filter(&store, "alpha", &MockEmbedder, 10, Some("technical")).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].memory.tags, vec!["technical"]);
     }
@@ -1018,17 +1289,36 @@ mod tests {
     #[test]
     fn recall_with_tag_filter_is_case_insensitive() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_with_tags("Jared", "likes", "alpha", Some(&[1.0, 0.0]), &["Preference".to_string()]).unwrap();
+        store
+            .remember_fact_with_tags(
+                "Jared",
+                "likes",
+                "alpha",
+                Some(&[1.0, 0.0]),
+                &["Preference".to_string()],
+            )
+            .unwrap();
 
-        let results = recall_with_tag_filter(&store, "alpha", &MockEmbedder, 10, Some("preference")).unwrap();
+        let results =
+            recall_with_tag_filter(&store, "alpha", &MockEmbedder, 10, Some("preference")).unwrap();
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn recall_with_no_tag_filter_returns_all() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.remember_fact_with_tags("Jared", "likes", "alpha", Some(&[1.0, 0.0]), &["preference".to_string()]).unwrap();
-        store.remember_fact("weather", "is", "alpha", Some(&[1.0, 0.0])).unwrap();
+        store
+            .remember_fact_with_tags(
+                "Jared",
+                "likes",
+                "alpha",
+                Some(&[1.0, 0.0]),
+                &["preference".to_string()],
+            )
+            .unwrap();
+        store
+            .remember_fact("weather", "is", "alpha", Some(&[1.0, 0.0]))
+            .unwrap();
 
         let results = recall_with_tag_filter(&store, "alpha", &MockEmbedder, 10, None).unwrap();
         assert_eq!(results.len(), 2);
