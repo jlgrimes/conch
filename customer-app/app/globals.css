@@ -1,13 +1,13 @@
 :root {
-  --bg: #f8f7f1;
-  --surface: #fffdf4;
-  --ink: #162028;
-  --muted: #50616d;
-  --line: #d6d8cd;
-  --accent: #0f766e;
-  --accent-strong: #0b5c56;
+  --bg: #0a0a0a;
+  --surface: #0f0f0f;
+  --ink: #f5f5f5;
+  --muted: #9ca3af;
+  --line: #232323;
+  --accent: #ff6b6b;
+  --accent-strong: #ff8787;
   --radius: 18px;
-  --shadow: 0 10px 35px rgba(16, 24, 40, 0.07);
+  --shadow: 0 10px 35px rgba(0, 0, 0, 0.28);
 }
 
 * {
@@ -24,8 +24,8 @@ body {
   font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
   color: var(--ink);
   background:
-    radial-gradient(circle at 10% 0%, rgba(15, 118, 110, 0.14), transparent 40%),
-    radial-gradient(circle at 100% 30%, rgba(28, 137, 199, 0.12), transparent 36%),
+    radial-gradient(circle at 10% 0%, rgba(255, 107, 107, 0.12), transparent 40%),
+    radial-gradient(circle at 100% 30%, rgba(255, 135, 135, 0.08), transparent 36%),
     var(--bg);
 }
 
@@ -38,7 +38,7 @@ body {
 }
 
 .card {
-  background: color-mix(in srgb, var(--surface) 94%, #ffffff 6%);
+  background: color-mix(in srgb, var(--surface) 94%, #000000 6%);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -61,13 +61,13 @@ body {
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 8px 14px;
-  background: #ffffff;
+  background: #111111;
 }
 
 .top-nav .active-nav {
   border-color: color-mix(in srgb, var(--accent) 70%, #ffffff 30%);
-  color: #0c4c49;
-  background: #e1f2ef;
+  color: #ffffff;
+  background: rgba(255, 107, 107, 0.18);
 }
 
 .hero {
@@ -83,7 +83,7 @@ body {
   width: 280px;
   height: 280px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(15, 118, 110, 0.2), rgba(15, 118, 110, 0));
+  background: radial-gradient(circle, rgba(255, 107, 107, 0.2), rgba(255, 107, 107, 0));
 }
 
 .eyebrow {
@@ -171,7 +171,7 @@ section .section-note {
   border: 1px solid var(--line);
   border-radius: 14px;
   padding: 14px;
-  background: #ffffff;
+  background: #141414;
 }
 
 .tier p {
@@ -208,7 +208,7 @@ textarea {
   padding: 10px 12px;
   font: inherit;
   color: inherit;
-  background: #ffffff;
+  background: #141414;
 }
 
 textarea {
@@ -218,12 +218,12 @@ textarea {
 
 .secondary-btn {
   width: fit-content;
-  background: #e1f2ef;
-  color: #0c4c49;
+  background: rgba(255, 107, 107, 0.18);
+  color: #ffd2d2;
 }
 
 .secondary-btn:hover {
-  background: #d1ece8;
+  background: rgba(255, 107, 107, 0.28);
   transform: translateY(-1px);
 }
 
@@ -262,7 +262,7 @@ textarea {
 .engagement-item {
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: #ffffff;
+  background: #141414;
   padding: 14px;
   display: flex;
   align-items: center;

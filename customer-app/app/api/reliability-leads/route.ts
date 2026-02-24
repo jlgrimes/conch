@@ -56,7 +56,7 @@ export async function POST(req: Request) {
     email,
     team_size: teamSize || null,
     use_case: useCase || null,
-    source: "app.conch.lol",
+    source: "app.conch.so",
   });
 
   if (error) {

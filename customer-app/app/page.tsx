@@ -35,7 +35,7 @@ export default async function Home({ searchParams }: { searchParams: SearchParam
           We help teams ship AI memory that is auditable, resilient under load, and actually useful in live user workflows.
         </p>
         <div className="cta-row">
-          <a href="https://conch.lol/reliability" className="primary-btn">
+          <a href="https://conch.so/reliability" className="primary-btn">
             See engagement details
           </a>
           <span className="cta-note">Request onboarding and we’ll respond with next steps fast.</span>
